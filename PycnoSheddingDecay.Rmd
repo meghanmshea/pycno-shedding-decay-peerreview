@@ -1,0 +1,2922 @@
+---
+title: "Sunflower sea star (Pycnopodia helianthoides) environmental DNA (eDNA) shedding and decay: Influence of sunlight and comparison to other marine organisms"
+author: "Meghan M. Shea"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    df_print: paged
+    code_download: true
+    code_folding: show
+---
+
+
+```{r, setup, include=FALSE}
+# ============================================================
+# RMarkdown Setup
+# ============================================================
+# Setting up RMarkdown to knit properly
+
+knitr::opts_chunk$set(echo = TRUE, tidy = "styler")
+knitr::opts_chunk$set(cache.path = "cache/")
+
+```
+
+
+```{r, Loading Packages, message = FALSE, warning = FALSE, results = FALSE}
+# ============================================================
+# Loading Packages
+# ============================================================
+# Using renv to load the correct versions of all essential packages
+
+renv::restore()
+
+library(tidyverse)
+library(ggpmisc)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(readxl)
+library(rgbif)
+library(rphylopic)
+library(grid)
+library(fs)
+library(lme4)
+library(performance)
+library(car)
+```
+
+
+```{r, Repeated Functions & Variables}
+# ============================================================
+# Repeated Functions
+# ============================================================
+# Establishing functions up front that are used throughout file
+
+# >>>> FIGURE SAVING FUNCTION <<<<
+#Saves .png and .pdf versions of a given figure
+save_pdf_png = function(plot, path, w, h, u = "mm", bg = "transparent", dpi = 600) {
+  for (x in c("pdf", "png")) {
+    ggsave(
+      plot = plot,
+      filename = paste0(path, x),
+      device = x,
+      bg = bg,
+      width = w,
+      height = h,
+      units = u,
+      dpi = dpi
+    )
+  }
+}
+
+# >>>> DROPLET LOD CALCULATOR <<<<
+#Calculates an estimated concentration in copies/L for a given number of droplets
+droplet_LOD = function(droplets, total_droplets, V_pcr, V_e, V_r, V_w) {
+  C <- -log((total_droplets - droplets)/total_droplets)/0.795
+  correction <- V_pcr * V_e / V_r / V_w
+  return(C*correction)
+}
+
+# >>>> SHARED PHYLOPIC ID <<
+# Sunflower sea star (Pycnopodia helianthoides) silhouette from PhyloPic,
+# used in both Figure 4 and Figure 5
+pycno_uuid <- "be5c73aa-407f-4a6f-b7ec-6061bec99d86"
+
+# >>>> SCIENTIFIC NOTATION AXIS LABEL FORMATTER <<
+# Formats axis labels as "1.5 x 10^6" (rendered with a real superscript via
+# plotmath) instead of scientific()'s "1.5e+06". 
+format_sci_10 <- function(x) {
+  labs <- sapply(x, function(val) {
+    if (is.na(val)) return("NA")  # ggplot calls this on out-of-range breaks too; "NA" parses
+                                   # fine as R code and these labels are never actually drawn
+    if (val == 0) return("0")
+    lab <- scales::scientific(val)             # e.g. "1.5e+06"
+    lab <- gsub("e\\+?", " %*% 10^", lab)       # -> "1.5 %*% 10^06"
+    lab <- gsub("\\^0+(\\d)", "^\\1", lab)      # drop leading zero in exponent
+    lab <- gsub("\\^-0+(\\d)", "^-\\1", lab)    # (and for negative exponents)
+    lab
+  })
+  parse(text = labs)
+}
+```
+
+
+```{r, Figure Theme Configuration}
+# ============================================================
+# Figure Theme Configuration
+# ============================================================
+# Central location for all figure styling elements
+# Applies to all figures in the paper for consistent appearance
+
+# ---- TYPOGRAPHY SETTINGS ----
+theme_font_sizes <- list(
+  axis_tick_labels = 10,      # Axis tick labels
+  legend_labels = 9,         # Legend entry labels
+  axis_labels = 11,           # Axis titles
+  legend_title = 11,          # Legend title
+  panel_annotations = 14      # Panel labels (A, B, C, etc.)
+)
+
+# ---- BASE THEME ----
+# Use this for all figures
+theme_paper <- function() {
+  theme_classic(base_size = 11) +  # base_size doesn't directly set our custom sizes
+  theme(
+    # Axis labels (x and y titles)
+    axis.title.x = element_text(size = theme_font_sizes$axis_labels),
+    axis.title.y = element_text(size = theme_font_sizes$axis_labels),
+    
+    # Axis tick labels (the numbers/text on axes)
+    axis.text.x = element_text(size = theme_font_sizes$axis_tick_labels),
+    axis.text.y = element_text(size = theme_font_sizes$axis_tick_labels),
+    
+    # Legend styling
+    legend.title = element_text(size = theme_font_sizes$legend_title),
+    legend.text = element_text(size = theme_font_sizes$legend_labels),
+    
+    # Standard margins
+    plot.margin = margin(l = 10, r = 5, t = 5, b = 5)
+  )
+}
+
+# >>>> PANEL ANNOTATION FUNCTION <<<<
+# Use this for all panel labels (A, B, C, etc.)
+# Works with both annotate() and annotation_custom()
+panel_label <- function(label, x = -Inf, y = Inf, hjust = -0.5, vjust = 1.5) {
+  annotate("text",
+           x = x, y = y, label = label,
+           hjust = hjust, vjust = vjust,
+           size = theme_font_sizes$panel_annotations / 2.8,  # ggplot size conversion
+           fontface = "bold"
+  )
+}
+
+# For use with annotation_custom() (as in Figure 6)
+panel_label_grob <- function(label) {
+  textGrob(label,
+           gp = gpar(fontsize = theme_font_sizes$panel_annotations,
+                     fontface = "bold"))
+}
+
+```
+
+
+```{r, ddPCR File Reading & QC Function}
+# ============================================================
+# ddPCR File Reading and QC Function
+# ============================================================
+# Establishing function for reading and checking ddPCR files
+
+# >>>> READING ddPCR FUNCTION <<<<
+
+# Reads in ddPCR files and performs initial quality control
+read_ddpcr_files <- function(ddPCR_file_location, extraction_file_location, output_name,
+                              exclude_samples = NULL,
+                              exclude_wells = NULL,        # manual per-well exclusion (e.g. known pipetting errors)
+                              parse_dilution = FALSE,      # parse "<id><sep><num>_<denom>" style extract_id
+                              dilution_sep = " ",          # separator between id and dilution code, e.g. "3008 1_5"
+                              fb_column = NULL, fb_value = "FB",
+                              eb_column = "sample_id", eb_value = "EB",
+                              V_pcr = 20,      # PCR reaction volume (µL)
+                              V_e = 100,       # DNA extraction elution volume (µL)
+                              V_r = 5,         # Template volume added to PCR (µL)
+                              V_w = NULL,      # Water sample volume (L). Either:
+                                               #   - a single number (same V_w for every sample - original behavior), or
+                                               #   - a data frame with a join column (see V_w_join_by) and a "V_w"
+                                               #     column, for files where different samples need different V_w
+                                               #     (e.g. an inhibition-testing plate pulling from both the decay
+                                               #     and shedding sample pools)
+                              V_w_join_by = "extract_id",  # column in combined_data to join the V_w lookup on
+                              add_log_transform = FALSE,  # Whether to add log10 columns
+                              time_prefix = NULL,         # Prefix to remove from sampling_time (e.g., "D-", "S-")
+                              min_droplets = 10000,       # Minimum accepted droplets for a well to be trusted
+                              cv_threshold = 0.2) {       # CV threshold for replicate pairs
+
+  # Initialize tracking variables
+  total_samples <- 0
+  total_pos_controls <- 0
+  total_ntc_controls <- 0
+  samples_replaced <- 0
+  samples_replaced_amplification_error <- 0
+  samples_replaced_pipetting_error <- 0   # NEW
+  samples_failed_droplet_qc <- 0
+  samples_excluded <- 0
+  field_blanks <- 0
+  extraction_blanks <- 0
+
+  # ========================================
+  # Dedicated environment for temp frames
+  # ========================================
+  # Using a private environment (instead of .GlobalEnv) means ls()/get()/assign()
+  # calls below can only ever see objects this function created, so we can't
+  # accidentally process or delete unrelated objects in the user's workspace,
+  # and the function is safe to run multiple times in the same session.
+  work_env <- new.env()
+
+  # ========================================
+  # Helper functions for console output
+  # ========================================
+  print_main_section <- function(title) {
+    cat("\n")
+    cat("╔════════════════════════════════════════╗\n")
+    cat("║", format(title, width = 38, justify = "centre"), "║\n")
+    cat("╚════════════════════════════════════════╝\n\n")
+  }
+
+  # Read in all csv files from specified location
+  csv_files <- list.files(ddPCR_file_location,
+                           pattern = "\\.csv$",
+                           full.names = TRUE)
+
+  walk(csv_files, function(file) {
+    df_name <- tools::file_path_sans_ext(basename(file))
+    # Read the full data
+    full_data <- read_csv(file, show_col_types = FALSE)
+    # Split into M wells and other wells
+    m_wells <- full_data %>% filter(str_starts(Well, "M"))
+    other_wells <- full_data %>% filter(!str_starts(Well, "M"))
+    # Assign to separate data frames in the private work environment
+    assign(paste0(df_name, "_M"), m_wells, envir = work_env)
+    assign(paste0(df_name, "_other"), other_wells, envir = work_env)
+  })
+
+  cat("Imported", length(csv_files), "CSV files from", ddPCR_file_location, "\n")
+
+  # ========================================
+  # QC - Controls
+  # ========================================
+  print_main_section("QC - Controls")
+
+  m_files <- ls(pattern = "_M$", envir = work_env)
+
+  for (m_name in m_files) {
+    m_df <- get(m_name, envir = work_env)
+
+    # Count controls separately and samples from M files
+    pos_controls <- m_df %>% filter(SampleType == "PosCtrl")
+    ntc_controls <- m_df %>% filter(SampleType == "NTC")
+    samples <- m_df %>% filter(!SampleType %in% c("PosCtrl", "NTC"))
+
+    total_pos_controls <- total_pos_controls + nrow(pos_controls)
+    total_ntc_controls <- total_ntc_controls + nrow(ntc_controls)
+    total_samples <- total_samples + nrow(samples)
+
+    # Display control info
+    controls_display <- m_df %>%
+      filter(SampleType %in% c("PosCtrl", "NTC")) %>%
+      dplyr::select(Well, SampleType, `Conc(copies/µL)`)
+
+    if (nrow(controls_display) > 0) {
+      cat("File:", m_name, "\n")
+      print(controls_display)
+      cat("\n")
+    }
+  }
+
+  print_main_section("QC - Positive Droplets & Replicate CV")
+
+  other_files <- ls(pattern = "_other$", envir = work_env)
+
+  for (other_name in other_files) {
+    cat("Processing: ", other_name, "\n")
+    cat("────────────────────────────────────────\n\n")
+
+    m_name <- str_replace(other_name, "_other$", "_M")
+    other_df <- get(other_name, envir = work_env)
+    m_df <- get(m_name, envir = work_env)
+
+    # Track if any changes are made
+    changes_made <- FALSE
+
+    # ========================================
+    # NEW: Manual exclusion of flagged wells
+    # ========================================
+    # For errors the automated checks below wouldn't catch (e.g. a known
+    # pipetting error on one specific well). Because both replicates of a
+    # sample share the same "Sample description 1", they can't be told apart
+    # by sample name alone - this works off Well IDs instead, so exactly the
+    # bad replicate is dropped and the good one is kept.
+    #
+    # exclude_wells can be:
+    #   - a plain character vector of well IDs, applied to every file, or
+    #   - a data frame with columns "file" (csv basename, no extension) and
+    #     "well", so the same well label (e.g. "A01") on different plates
+    #     isn't accidentally excluded everywhere
+    if (!is.null(exclude_wells)) {
+      file_label <- str_remove(other_name, "_other$")
+
+      wells_to_drop <- if (is.data.frame(exclude_wells)) {
+        exclude_wells %>% filter(file == file_label) %>% pull(well)
+      } else {
+        exclude_wells
+      }
+
+      flagged <- other_df %>% filter(Well %in% wells_to_drop)
+
+      if (nrow(flagged) > 0) {
+        cat("Manual Exclusion (flagged wells):\n")
+        for (i in seq_len(nrow(flagged))) {
+          cat("  Well =", flagged$Well[i], ", Sample =",
+              flagged$`Sample description 1`[i], " -> excluded\n")
+        }
+        cat("\n")
+
+        affected_samples <- unique(flagged$`Sample description 1`)
+        other_df <- other_df %>% filter(!Well %in% wells_to_drop)
+
+        # If a sample had 2 replicates and now has exactly 1 left, treat that
+        # surviving replicate as the merged value - same pattern used below
+        # for low-droplet and high-CV replacements.
+        for (sample_name in affected_samples) {
+          remaining <- other_df %>% filter(`Sample description 1` == sample_name)
+
+          if (nrow(remaining) == 1) {
+            old_m_row <- m_df %>% filter(`Sample description 1` == sample_name)
+            cat("  → Replacing Merged Well (", old_m_row$Well, ") with surviving Well (",
+                remaining$Well[1], ") for sample ", sample_name,
+                " (other replicate excluded)\n\n", sep = "")
+            m_df <- rows_update(m_df, remaining[1, ], by = "Sample description 1")
+            samples_replaced_pipetting_error <- samples_replaced_pipetting_error + 1
+            changes_made <- TRUE
+          } else if (nrow(remaining) == 0) {
+            cat("  ⚠ Both replicates for sample ", sample_name,
+                " were excluded - no data remains for this sample.\n\n", sep = "")
+          }
+        }
+
+        assign(m_name, m_df, envir = work_env)
+      }
+    }
+
+    # ========================================
+    # Check for samples with insufficient droplets
+    # ========================================
+    # A group can end up in one of three states:
+    #   (a) all replicates >= min_droplets -> no action needed
+    #   (b) some replicates < min_droplets, at least one >= min_droplets
+    #       -> replace the merged well with the good single replicate
+    #   (c) ALL replicates < min_droplets -> nothing usable to replace with;
+    #       this used to be silently dropped with no warning. Now flagged.
+    droplet_groups <- other_df %>%
+      group_by(`Sample description 1`) %>%
+      filter(any(`Accepted Droplets` < min_droplets)) %>%
+      ungroup()
+
+    replacements <- droplet_groups %>%
+      group_by(`Sample description 1`) %>%
+      filter(`Accepted Droplets` >= min_droplets) %>%
+      ungroup()
+
+    fully_failed_samples <- droplet_groups %>%
+      group_by(`Sample description 1`) %>%
+      filter(all(`Accepted Droplets` < min_droplets)) %>%
+      ungroup()
+
+    if (nrow(replacements) > 0) {
+      cat("Insufficient Droplets:\n")
+      cat("Found", nrow(replacements), "sample(s) with low droplets:\n\n")
+      samples_replaced <- samples_replaced + nrow(replacements)
+      changes_made <- TRUE
+
+      for (i in seq_len(nrow(replacements))) {
+        sample_name <- replacements$`Sample description 1`[i]
+        both_duplicates <- other_df %>% filter(`Sample description 1` == sample_name)
+        old_m_row <- m_df %>% filter(`Sample description 1` == sample_name)
+
+        cat("Sample:", sample_name, "\n")
+        for (j in seq_len(nrow(both_duplicates))) {
+          cat("  Well =", both_duplicates$Well[j], ", Accepted Droplets =",
+              both_duplicates$`Accepted Droplets`[j], "\n")
+        }
+        cat("  → Replacing Merged Well (", old_m_row$Well, ") with Well (",
+            replacements$Well[i], ")\n\n", sep = "")
+      }
+
+      m_df <- rows_update(m_df, replacements, by = "Sample description 1")
+      assign(m_name, m_df, envir = work_env)
+    } else {
+      cat("Insufficient Droplets:\n")
+      cat("✓ No replacements needed\n\n")
+    }
+
+    if (nrow(fully_failed_samples) > 0) {
+      failed_ids <- unique(fully_failed_samples$`Sample description 1`)
+      samples_failed_droplet_qc <- samples_failed_droplet_qc + length(failed_ids)
+
+      cat("⚠ QC FAILURE: ", length(failed_ids),
+          " sample(s) have ALL replicates below ", min_droplets,
+          " accepted droplets.\n", sep = "")
+      cat("  No replicate is usable as a substitute; the merged-well value\n")
+      cat("  for these samples has NOT been corrected and should be treated\n")
+      cat("  as unreliable / reviewed manually:\n\n")
+
+      for (sample_name in failed_ids) {
+        both_duplicates <- other_df %>% filter(`Sample description 1` == sample_name)
+        cat("  Sample:", sample_name, "\n")
+        for (j in seq_len(nrow(both_duplicates))) {
+          cat("    Well =", both_duplicates$Well[j], ", Accepted Droplets =",
+              both_duplicates$`Accepted Droplets`[j], "\n")
+        }
+      }
+      cat("\n")
+    }
+
+    # ========================================
+    # Check CV for replicate pairs
+    # ========================================
+    cat("Replicate CV Check:\n")
+
+    cv_data <- other_df %>%
+      filter(!SampleType %in% c("PosCtrl", "NTC")) %>%
+      group_by(`Sample description 1`) %>%
+      filter(n() > 1 & all(`Accepted Droplets` >= min_droplets)) %>%
+      summarise(
+        mean_conc = mean(`Conc(copies/µL)`, na.rm = TRUE),
+        sd_conc = sd(`Conc(copies/µL)`, na.rm = TRUE),
+        cv = sd_conc / mean_conc,
+        .groups = "drop"
+      ) %>%
+      filter(cv > cv_threshold)
+
+    if (nrow(cv_data) > 0) {
+      cat("⚠ Found", nrow(cv_data), "replicate pair(s) with CV >", cv_threshold, ":\n\n")
+      cv_replacements <- tibble()
+
+      for (i in seq_len(nrow(cv_data))) {
+        extract <- cv_data$`Sample description 1`[i]
+        cv_val <- round(cv_data$cv[i], 4)
+        mean_val <- round(cv_data$mean_conc[i], 2)
+
+        cat("Extract ID:", extract, "| CV:", cv_val,
+            "| Mean conc:", mean_val, "copies/µL\n")
+
+        both_replicates <- other_df %>%
+          filter(`Sample description 1` == extract & !SampleType %in% c("PosCtrl", "NTC"))
+        total_positive_droplets <- sum(both_replicates$Positives, na.rm = TRUE)
+
+        # Condition 1: Less than 3 positive droplets collectively
+        if (total_positive_droplets < 3) {
+          cat("  ℹ No Action Taken: Replicates collectively have less than 3 positive\n")
+          cat("    droplets, so high CV is not meaningful.\n\n")
+        }
+        # Condition 2: One replicate has 0 positive droplets
+        else if (any(both_replicates$Positives == 0)) {
+          good_rep <- both_replicates %>% filter(Positives > 0)
+          cat("  Sample: ", extract, "\n")
+          for (j in seq_len(nrow(both_replicates))) {
+            cat("    Well =", both_replicates$Well[j], ", Positive Droplets =",
+                both_replicates$Positives[j], "\n")
+          }
+          cat("  → Replacing Merged Well (",
+              m_df$Well[m_df$`Sample description 1` == extract],
+              ") with Well (", good_rep$Well[1],
+              ") because high CV\n    was due to one sample not amplifying.\n\n", sep = "")
+          cv_replacements <- bind_rows(cv_replacements, good_rep[1, ])
+          samples_replaced_amplification_error <- samples_replaced_amplification_error + 1
+          changes_made <- TRUE
+        }
+        # Condition 3: Neither condition applies
+        else {
+          cat("  ⚠ ACTION NEEDED: High CV should be further investigated.\n\n")
+        }
+      }
+
+      if (nrow(cv_replacements) > 0) {
+        m_df <- rows_update(m_df, cv_replacements, by = "Sample description 1")
+        assign(m_name, m_df, envir = work_env)
+      }
+    } else {
+      cat("✓ All replicate pairs have CV ≤", cv_threshold, "\n\n")
+    }
+
+    # ========================================
+    # Print final status for this file
+    # ========================================
+    if (changes_made) {
+      cat("✓ Updated", m_name, "\n\n")
+    } else {
+      cat("✓ No changes needed\n\n")
+    }
+  }
+
+  # Combine all _M files into one dataframe (excluding controls)
+  m_files <- ls(pattern = "_M$", envir = work_env)
+  combined_data <- map_df(m_files, function(m_name) {
+    get(m_name, envir = work_env)
+  }) %>%
+    filter(!SampleType %in% c("PosCtrl", "NTC"))
+
+  # Select and rename columns needed for subsequent analyses
+  combined_data <- combined_data %>% select(
+    well = Well,
+    extract_id = `Sample description 1`,
+    conc_copies_uL_raw = `Conc(copies/µL)`,
+    accepted_droplets = `Accepted Droplets`,
+    positive_droplets = Positives,
+    negative_droplets = Negatives,
+    merged_wells = MergedWells,
+    total_conf_max = TotalConfMax,
+    total_conf_min = TotalConfMin,
+    poisson_conf_max = PoissonConfMax,
+    poisson_conf_min = PoissonConfMin,
+    total_conf_max_68 = TotalConfidenceMax68,
+    total_conf_min_68 = TotalConfidenceMin68,
+    poisson_conf_max_68 = PoissonConfidenceMax68,
+    poisson_conf_min_68 = PoissonConfidenceMin68
+  )
+
+  # ========================================
+  # NEW: Parse dilution factor out of extract_id
+  # ========================================
+  # Some plates (e.g. inhibition testing) name diluted samples as
+  # "<id><dilution_sep><numerator>_<denominator>", e.g. "3008 1_5" for a 1:5
+  # dilution, while undiluted samples are just "<id>", e.g. "3008". This
+  # strips the dilution code off extract_id (so it can still join to the
+  # extraction record on the plain numeric ID) and multiplies concentration
+  # + all confidence bounds by the dilution factor, before any volume
+  # correction happens.
+  if (parse_dilution) {
+    print_main_section("Parsing Dilution Factors")
+
+    combined_data <- combined_data %>%
+      mutate(
+        extract_id_full = extract_id,
+        extract_id = str_trim(str_extract(extract_id_full, paste0("^[^", dilution_sep, "]+"))),
+        dilution_code = str_trim(str_remove(extract_id_full, paste0("^[^", dilution_sep, "]+")))
+      )
+
+    dil_parts <- str_split_fixed(combined_data$dilution_code, "_", 2)
+
+    combined_data <- combined_data %>%
+      mutate(
+        dilution_factor = ifelse(
+          dilution_code == "",
+          1,
+          as.numeric(dil_parts[, 2]) / as.numeric(dil_parts[, 1])
+        )
+      ) %>%
+      select(-extract_id_full, -dilution_code)
+
+    cat("✓ Parsed dilution codes from extract_id, e.g.:\n")
+    cat("    '3008 1_5' -> extract_id = '3008', dilution_factor = 5\n")
+    cat("    '3008'     -> extract_id = '3008', dilution_factor = 1\n\n")
+
+    combined_data <- combined_data %>%
+      mutate(
+        conc_copies_uL_raw   = conc_copies_uL_raw   * dilution_factor,
+        total_conf_max       = total_conf_max       * dilution_factor,
+        total_conf_min       = total_conf_min       * dilution_factor,
+        poisson_conf_max     = poisson_conf_max     * dilution_factor,
+        poisson_conf_min     = poisson_conf_min     * dilution_factor,
+        total_conf_max_68    = total_conf_max_68    * dilution_factor,
+        total_conf_min_68    = total_conf_min_68    * dilution_factor,
+        poisson_conf_max_68  = poisson_conf_max_68  * dilution_factor,
+        poisson_conf_min_68  = poisson_conf_min_68  * dilution_factor
+      )
+
+    cat("✓ Applied dilution_factor to concentration and confidence bounds\n\n")
+  }
+
+  # Combine with sample identifier information
+  extraction_record <- read_csv(extraction_file_location, show_col_types = FALSE) %>%
+    select(
+      sampling_date = Date,
+      sampling_start = `Sampling Start`,
+      sampling_time = `Time Point`,
+      condition = Condition,
+      replicate = Replicate,
+      sample_id = `Sample Identifier`,
+      extract_id = `Extract Storage Number`,
+      extraction_date = `Extraction Date`
+    ) %>%
+    # Coerce to numeric here too, so both sides of the join use the same type.
+    # Without this, e.g. character "007" vs numeric 7 silently fails to match.
+    mutate(extract_id = as.numeric(extract_id))
+
+  combined_data <- combined_data %>%
+    mutate(extract_id = as.numeric(extract_id)) %>%
+    left_join(extraction_record, by = "extract_id")
+
+  # Handle sample exclusions
+  if (!is.null(exclude_samples)) {
+    print_main_section("Excluding Samples")
+    excluded_data <- combined_data %>%
+      filter(sample_id %in% exclude_samples)
+    samples_excluded <- nrow(excluded_data)
+
+    if (samples_excluded > 0) {
+      cat("Excluding", samples_excluded, "non-relevant sample(s):\n\n")
+      for (sample in exclude_samples) {
+        matching <- excluded_data %>% filter(sample_id == sample)
+        if (nrow(matching) > 0) {
+          cat("  • ", sample, " (extract_id: ", matching$extract_id[1], ")\n", sep = "")
+        }
+      }
+      cat("\n")
+      combined_data <- combined_data %>%
+        filter(!sample_id %in% exclude_samples)
+    } else {
+      cat("No samples matched exclusion criteria\n\n")
+    }
+  }
+
+  # Handle field blanks and extraction blanks
+  if (!is.null(fb_column) || !is.null(eb_column)) {
+    print_main_section("FB and EB Controls")
+
+    fb_filter <- if (!is.null(fb_column)) combined_data[[fb_column]] == fb_value else rep(FALSE, nrow(combined_data))
+    eb_filter <- if (!is.null(eb_column)) combined_data[[eb_column]] == eb_value else rep(FALSE, nrow(combined_data))
+
+    blanks_data <- combined_data %>% filter(fb_filter | eb_filter)
+
+    if (nrow(blanks_data) > 0) {
+      if (!is.null(fb_column)) {
+        field_blanks <- sum(blanks_data[[fb_column]] == fb_value, na.rm = TRUE)
+      }
+      if (!is.null(eb_column)) {
+        extraction_blanks <- sum(blanks_data[[eb_column]] == eb_value, na.rm = TRUE)
+      }
+
+      display_cols <- c("sample_id", "positive_droplets")
+      if (!is.null(fb_column) && fb_column != "sample_id") {
+        display_cols <- c(fb_column, display_cols)
+      }
+      if (!is.null(eb_column) && eb_column != "sample_id" && eb_column != fb_column) {
+        display_cols <- c(eb_column, display_cols)
+      }
+
+      print(blanks_data %>% select(all_of(unique(display_cols))))
+      cat("\n")
+
+      combined_data <- combined_data %>% filter(!(fb_filter | eb_filter))
+      cat("✓ Removed", field_blanks, "field blank(s) and", extraction_blanks, "extraction blank(s)\n\n")
+    } else {
+      cat("No field blanks or extraction blanks found\n\n")
+    }
+  }
+
+  # ========================================
+  # Lambda (Poisson rate) column
+  # ========================================
+  # lambda = -ln(negative_droplets / accepted_droplets)
+  combined_data <- combined_data %>%
+    mutate(lambda = -log(negative_droplets / accepted_droplets))
+
+  # ========================================
+  # Volume corrections and transformations
+  # ========================================
+  if (!is.null(V_w)) {
+    print_main_section("Applying Volume Corrections")
+
+    cat("PCR reaction volume (V_pcr):        ", V_pcr, "µL\n")
+    cat("DNA extraction elution (V_e):       ", V_e, "µL\n")
+    cat("Template added to PCR (V_r):        ", V_r, "µL\n")
+
+    if (is.data.frame(V_w)) {
+      # NEW: per-sample V_w, for plates that mix samples that came from
+      # experiments with different sample volumes (e.g. inhibition testing
+      # pulling from both the decay pool [V_w = 1 L] and the shedding pool
+      # [V_w = 0.53 L]). V_w must have a "V_w" column and a column matching
+      # V_w_join_by (e.g. "extract_id", "sample_id", or "condition").
+      if (!all(c(V_w_join_by, "V_w") %in% names(V_w))) {
+        stop("V_w lookup table must contain columns '", V_w_join_by, "' and 'V_w'")
+      }
+
+      cat("Water sample volume (V_w):            varies by sample (joined on '",
+          V_w_join_by, "')\n\n", sep = "")
+
+      combined_data <- combined_data %>%
+        left_join(V_w, by = V_w_join_by)
+
+      n_missing_vw <- sum(is.na(combined_data$V_w))
+      if (n_missing_vw > 0) {
+        warning(n_missing_vw, " sample(s) had no matching V_w in the lookup table; ",
+                "their volume-corrected columns will be NA.")
+      }
+
+      combined_data <- combined_data %>%
+        mutate(
+          .correction          = V_pcr * V_e / V_r / V_w,
+          copies_per_L         = conc_copies_uL_raw * .correction,
+          total_conf_min_L     = coalesce(total_conf_min * .correction, poisson_conf_min * .correction),
+          total_conf_max_L     = coalesce(total_conf_max * .correction, poisson_conf_max * .correction),
+          total_conf_min_68_L  = coalesce(total_conf_min_68 * .correction, poisson_conf_min_68 * .correction),
+          total_conf_max_68_L  = coalesce(total_conf_max_68 * .correction, poisson_conf_max_68 * .correction)
+        ) %>%
+        select(-.correction)
+
+    } else {
+      # Original behavior: a single V_w applied to every sample in the file
+      correction <- V_pcr * V_e / V_r / V_w
+
+      cat("Water sample volume (V_w):          ", V_w, "L\n")
+      cat("Correction factor:                  ", correction, "\n\n")
+
+      combined_data <- combined_data %>%
+        mutate(
+          copies_per_L = conc_copies_uL_raw * correction,
+          total_conf_min_L = coalesce(total_conf_min * correction, poisson_conf_min * correction),
+          total_conf_max_L = coalesce(total_conf_max * correction, poisson_conf_max * correction),
+          total_conf_min_68_L = coalesce(total_conf_min_68 * correction, poisson_conf_min_68 * correction),
+          total_conf_max_68_L = coalesce(total_conf_max_68 * correction, poisson_conf_max_68 * correction)
+        )
+    }
+
+    cat("✓ Added columns: copies_per_L, total_conf_min_L, total_conf_max_L\n")
+
+    if (add_log_transform) {
+      combined_data <- combined_data %>%
+        mutate(
+          copies_per_L_log = log10(copies_per_L),
+          total_conf_min_L_log = log10(total_conf_min_L),
+          total_conf_max_L_log = log10(total_conf_max_L)
+        )
+      cat("✓ Added log10 transformed columns\n")
+    }
+    cat("\n")
+  }
+
+  # Add hours_elapsed column if time_prefix is specified
+  if (!is.null(time_prefix)) {
+    print_main_section("Parsing Time Information")
+    combined_data <- combined_data %>%
+      mutate(hours_elapsed = as.numeric(str_remove(sampling_time, time_prefix)))
+    cat("✓ Extracted hours_elapsed from sampling_time\n")
+    cat("  (Removed prefix: '", time_prefix, "')\n\n", sep = "")
+  }
+
+  # Create summary list
+  summary_stats <- list(
+    total_pos_controls = total_pos_controls,
+    total_ntc_controls = total_ntc_controls,
+    field_blanks = field_blanks,
+    extraction_blanks = extraction_blanks,
+    samples_excluded = samples_excluded,
+    samples_replaced = samples_replaced,
+    samples_replaced_amplification_error = samples_replaced_amplification_error,
+    samples_replaced_pipetting_error = samples_replaced_pipetting_error,
+    samples_failed_droplet_qc = samples_failed_droplet_qc,
+    experimental_samples = total_samples - samples_excluded - field_blanks - extraction_blanks,
+    total_samples_processed = total_pos_controls + total_ntc_controls + total_samples
+  )
+
+  # Assign final results to global environment (this is the intended output
+  # of the function, unlike the temp _M/_other frames which now live in
+  # the private work_env and are simply discarded when the function returns)
+  assign(output_name, combined_data, envir = .GlobalEnv)
+  assign(paste0(output_name, "_summary"), summary_stats, envir = .GlobalEnv)
+
+  print_main_section("Processing Complete")
+  cat("Combined data saved as '", output_name, "'\n", sep = "")
+  cat("Summary statistics saved as '", output_name, "_summary'\n", sep = "")
+  cat("Temporary per-file data frames were kept in a private environment\n")
+  cat("and were not written to your workspace.\n\n")
+
+  # Print final summary
+  print_main_section("PROCESSING SUMMARY")
+  cat("Total samples processed:\n")
+  cat("  • Positive controls (PosCtrl):        ", total_pos_controls, "\n")
+  cat("  • Negative controls (NTC):            ", total_ntc_controls, "\n")
+  cat("  • Field blanks (FB):                  ", field_blanks, "\n")
+  cat("  • Extraction blanks (EB):             ", extraction_blanks, "\n")
+  cat("  • Excluded samples (not relevant):    ", samples_excluded, "\n")
+  cat("  • Experimental samples:               ", summary_stats$experimental_samples, "\n")
+  cat("  • TOTAL:                              ", summary_stats$total_samples_processed, "\n\n")
+
+  cat("Quality control actions:\n")
+  cat("  • Samples with insufficient droplets: ", samples_replaced, "\n")
+  cat("    (Replaced with single replicate\n")
+  cat("     having ≥", min_droplets, " droplets)\n", sep = "")
+  cat("  • Amplification errors detected:      ", samples_replaced_amplification_error, "\n")
+  cat("    (Replaced with single replicate\n")
+  cat("     because other did not amplify)\n")
+  cat("  • Manually flagged pipetting errors:  ", samples_replaced_pipetting_error, "\n")
+  cat("    (Replaced with surviving replicate\n")
+  cat("     after excluding the flagged well)\n")
+  cat("  • Samples failing droplet QC entirely: ", samples_failed_droplet_qc, "\n")
+  cat("    (ALL replicates below ", min_droplets,
+      " droplets; left uncorrected, needs manual review)\n\n", sep = "")
+
+  invisible(summary_stats)
+}
+
+
+# ============================================================
+# ddPCR File Reading and QC
+# ============================================================
+# Reading and QCing shedding, decay, and inhibition files
+
+report_partitions <- function(df, label) {
+  ad <- df$accepted_droplets
+  lam <- df$lambda
+
+  stats <- list(
+    accepted_droplets = list(
+      mean = mean(ad, na.rm = TRUE),
+      sd = sd(ad, na.rm = TRUE),
+      min = min(ad, na.rm = TRUE),
+      max = max(ad, na.rm = TRUE)
+    ),
+    lambda = list(
+      mean = mean(lam, na.rm = TRUE),
+      sd = sd(lam, na.rm = TRUE),
+      min = min(lam, na.rm = TRUE),
+      max = max(lam, na.rm = TRUE)
+    )
+  )
+
+  cat(sprintf(
+    "%s - accepted_droplets: mean = %.2f, SD = %.2f, range = [%.0f, %.0f]\n",
+    label,
+    stats$accepted_droplets$mean, stats$accepted_droplets$sd,
+    stats$accepted_droplets$min, stats$accepted_droplets$max
+  ))
+  cat(sprintf(
+    "%s - lambda: mean = %.4f, SD = %.4f, range = [%.4f, %.4f]\n",
+    label,
+    stats$lambda$mean, stats$lambda$sd,
+    stats$lambda$min, stats$lambda$max
+  ))
+
+  invisible(stats)
+}
+
+
+
+
+```
+
+
+```{r, ddPCR File Reading & QC }
+# ============================================================
+# ddPCR File Reading and QC
+# ============================================================
+# Reading and QCing shedding and decay files
+
+report_partitions <- function(df, label) {
+  ad <- df$accepted_droplets
+  lam <- df$lambda
+
+  stats <- list(
+    accepted_droplets = list(
+      mean = mean(ad, na.rm = TRUE),
+      sd = sd(ad, na.rm = TRUE),
+      min = min(ad, na.rm = TRUE),
+      max = max(ad, na.rm = TRUE)
+    ),
+    lambda = list(
+      mean = mean(lam, na.rm = TRUE),
+      sd = sd(lam, na.rm = TRUE),
+      min = min(lam, na.rm = TRUE),
+      max = max(lam, na.rm = TRUE)
+    )
+  )
+
+  cat(sprintf(
+    "%s - accepted_droplets: mean = %.2f, SD = %.2f, range = [%.0f, %.0f]\n",
+    label,
+    stats$accepted_droplets$mean, stats$accepted_droplets$sd,
+    stats$accepted_droplets$min, stats$accepted_droplets$max
+  ))
+  cat(sprintf(
+    "%s - lambda: mean = %.4f, SD = %.4f, range = [%.4f, %.4f]\n",
+    label,
+    stats$lambda$mean, stats$lambda$sd,
+    stats$lambda$min, stats$lambda$max
+  ))
+
+  invisible(stats)
+}
+
+
+#Decay
+read_ddpcr_files("Data/ddPCR Files/Decay",
+"Data/Extraction_Record.csv",
+"decay_data",
+exclude_samples = "SB W 0 m",
+fb_column = "replicate",
+eb_column = "sample_id",
+V_pcr = 20,
+V_e = 100,
+V_r = 5,
+V_w = 1,
+min_droplets = 10000,
+time_prefix = "D-")
+
+report_partitions(decay_data, "Decay data")
+
+#Shedding
+read_ddpcr_files("Data/ddPCR Files/Shedding",
+"Data/Extraction_Record.csv",
+"shedding_data",
+fb_column = "condition",
+eb_column = "sample_id",
+V_pcr = 20,
+V_e = 100,
+V_r = 5,
+V_w = 0.53,
+min_droplets = 10000,
+add_log_transform = TRUE,  # Shedding uses log transforms
+time_prefix = "S-")
+
+report_partitions(shedding_data, "Shedding data")
+
+#Inhibition
+
+# This plate mixes samples originally drawn from the decay pool (V_w = 1 L)
+# and the shedding pool (V_w = 0.53 L), and some samples are run at 1:5 or
+# 1:10 dilutions (encoded in "Sample description 1" as e.g. "3008 1_5",
+# with undiluted samples as just "3008").
+#
+# Build a per-sample V_w lookup keyed on extract_id. Decay vs. shedding is
+# told apart by the "Time Point" prefix in the extraction record: "D-..."
+# means the sample came from the decay experiment (V_w = 1 L), "S-..."
+# means it came from the shedding experiment (V_w = 0.53 L).
+inhibition_vw_lookup <- read_csv("Data/Extraction_Record.csv", show_col_types = FALSE) %>%
+  transmute(
+    extract_id = as.numeric(`Extract Storage Number`),
+    V_w = case_when(
+      str_starts(`Time Point`, "D-") ~ 1,
+      str_starts(`Time Point`, "S-") ~ 0.53
+    )
+  )
+
+read_ddpcr_files(
+  "Data/ddPCR Files/Inhibition",
+  "Data/Extraction_Record.csv",
+  "inhibition_data",
+  exclude_wells = c("C02", "F04"),
+  parse_dilution = TRUE,
+  fb_column = "condition",
+  eb_column = "sample_id",
+  V_pcr = 20,
+  V_e = 100,
+  V_r = 5,
+  V_w = inhibition_vw_lookup,
+  V_w_join_by = "extract_id",
+  min_droplets = 10000
+)
+
+```
+
+
+```{r Decay Analysis}
+# ============================================================
+# Decay Analysis
+# ============================================================
+# Calculating decay rate constants
+
+#Calculate Decay LOD
+decay_LOD = droplet_LOD(3, mean(decay_data$accepted_droplets), 20, 100, 5, 1)
+
+# Calculate C0
+decay_data <- decay_data %>%
+  group_by(condition) %>%
+  mutate(
+    C0 = mean(copies_per_L[hours_elapsed == 0], na.rm = TRUE),
+    C0_stdev = sd(copies_per_L[hours_elapsed == 0], na.rm = TRUE),
+  ) %>%
+  ungroup()
+
+# Calculate ln(C/C0) and associated error
+decay_data <- decay_data %>%
+  mutate(
+    C_C0 = copies_per_L / C0,
+    ln_C_C0 = log(C_C0),
+    approx_C_stdev = pmax(total_conf_max_68_L - copies_per_L, copies_per_L - total_conf_min_68_L),
+    C_C0_stdev = C_C0*sqrt(((approx_C_stdev/copies_per_L)^2+(C0_stdev/C0)^2)),
+    ln_C_C0_lower_error = log(C_C0 - C_C0_stdev),
+    ln_C_C0_upper_error = log(C_C0 + C_C0_stdev)
+    
+  ) 
+
+# Fit models through origin
+fit_light <- lm(ln_C_C0 ~ 0 + hours_elapsed, data = subset(decay_data, condition == "Light"))
+fit_dark <- lm(ln_C_C0 ~ 0 + hours_elapsed, data = subset(decay_data, condition == "Dark"))
+fit_all <- lm(ln_C_C0 ~ 0 + hours_elapsed, data = decay_data)
+
+# View model summaries
+summary(fit_light)
+summary(fit_dark)
+summary(fit_all)
+
+# >>>> EXTRACT MODEL STATS FUNCTION <<<<
+#Saves the needed model stats in a data frame
+extract_model_stats <- function(model, condition_name) {
+  coef_summary <- summary(model)$coefficients["hours_elapsed", ]
+  data.frame(
+    Condition = condition_name,
+    k = -coef_summary["Estimate"],
+    SE = coef_summary["Std. Error"],
+    Adj_R2 = summary(model)$adj.r.squared,
+    Half_life = log(2) / -coef_summary["Estimate"]
+  )
+}
+
+#Group model results in summary data frame
+model_results_summary <- bind_rows(
+  extract_model_stats(fit_light, "Light"),
+  extract_model_stats(fit_dark, "Dark"),
+  extract_model_stats(fit_all, "All Combined")
+)
+
+#Calculate z-score
+z_score <- with(
+  model_results_summary,
+  (k[Condition == "Light"] - k[Condition == "Dark"]) /
+    sqrt(SE[Condition == "Light"]^2 + SE[Condition == "Dark"]^2)
+)
+p_value <- 2 * pnorm(-abs(z_score))
+
+```
+
+
+```{r Table 3}
+#NEED TO FORMAT
+
+# Table 3
+kable(model_results_summary,
+  digits = c(0, 4, 4, 4, 2), # Different decimals for each column
+  col.names = c(
+    "Condition",
+    "k (hr<sup>-1</sup>)",
+    "SE",
+    "Adjusted R<sup>2</sup>",
+    "Half-life (hr)"
+  ),
+  escape = FALSE
+) %>% # Allow HTML formatting
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+```{r Figure 3}
+#NEED TO FORMAT
+
+# Figure 3
+
+# Define shared plot elements
+condition_colors <- c("Light" = "#CCBB44", "Dark" = "#4477AA")
+
+shared_color_scale <- scale_color_manual(
+  values = condition_colors,
+  name = "Condition"
+)
+
+shared_fill_scale <- scale_fill_manual(
+  values = condition_colors,
+  name = "Condition"
+)
+
+
+
+# Panel A
+figure_3_A <- ggplot(decay_data, aes(x = hours_elapsed, y = copies_per_L, color = condition)) +
+  geom_errorbar(aes(ymin = total_conf_min_L, ymax = total_conf_max_L),
+                width = 0.5, linewidth = .5, color = "black"
+  ) +
+ geom_point(aes(fill = condition), shape = 21, color = "black", size = 2, stroke = 0.3) +
+  shared_color_scale +
+  shared_fill_scale +
+  panel_label("A") +  # Now uses the function from the header
+  labs(
+    x = NULL,
+    y = expression(atop(
+      italic("P. helianthoides") ~ "eDNA",
+      displaystyle("(Copies/L)")
+    ))
+  ) +
+  theme_paper() +  # CHANGED: replaced shared_theme with theme_paper()
+  theme(
+    axis.text.x = element_blank(),
+    legend.position = c(0.95, 0.95),
+    legend.justification = c(1, 1),
+    legend.direction = "horizontal",
+    legend.background = element_rect(color = "black", linewidth = 0.5)
+  )
+
+
+# Panel B
+figure_3_B <- ggplot(decay_data, aes(x = hours_elapsed, y = ln_C_C0, color = condition)) +
+  geom_errorbar(aes(ymin = ln_C_C0_lower_error, ymax = ln_C_C0_upper_error),
+                width = 0.5, linewidth = .5, color = "black"
+  ) +
+  geom_point(aes(fill = condition), shape = 21, color = "black", size = 2, stroke = 0.3) +
+  shared_color_scale +
+  shared_fill_scale +
+  geom_smooth(method = "lm", se = TRUE, formula = y ~ 0 + x) +
+  stat_poly_eq(
+    aes(label = paste(after_stat(eq.label),
+                      after_stat(adj.rr.label),
+                      sep = "~~~"
+    )),
+    formula = y ~ 0 + x,
+    parse = TRUE,
+    label.x = "right",
+    label.y = c(0.96, 0.84),
+    size = 4
+  ) +
+  panel_label("B") +  # Now uses the function from the header
+  labs(
+    x = "Hours Elapsed",
+    y = expression(atop(
+      italic("P. helianthoides") ~ "eDNA",
+      displaystyle("ln(C/C"[0] * ")")
+    ))
+  ) +
+  guides(color = "none", fill = "none") +
+  theme_paper() 
+
+# Combine plots vertically
+Figure_3 <- figure_3_A / figure_3_B
+
+
+path = "Figures/Figure3."
+save_pdf_png(
+  plot = Figure_3,
+  path = path,
+  w = 169,
+  h = 140
+)
+```
+
+
+```{r Shedding Analysis}
+#NEED TO FORMAT
+
+# Combine the cleaned data with star information
+star_information <- read_csv("Data/18Sept25 Star Data Post-eDNA Sampling - weights.csv",
+                              show_col_types = FALSE, name_repair = "universal") %>%
+  select(
+    condition = Star.ID,
+    star_name = Star.Name,
+    star_UPD_size_mm = UPD..Size..mm.,
+    star_weight_g = Star.Weight..g.
+  ) %>%
+  # Rank stars by tip-to-tip arm length (1 = lightest, 12 = heaviest)
+  mutate(size_rank = rank(star_UPD_size_mm, ties.method = "first"))
+
+shedding_data <- shedding_data %>% left_join(star_information, by = "condition")
+rm(star_information)
+
+# Combine the cleaned data with water volume
+water_volume <- read_csv("Data/18Sept25 Star Data Post-eDNA Sampling - aquaria volume.csv",
+                          show_col_types = FALSE, name_repair = "universal") %>%
+  select(
+    condition = Star.ID,
+    volume = Total.estimated.volume..L.
+  ) %>%
+  drop_na()
+
+shedding_data <- shedding_data %>% left_join(water_volume, by = "condition")
+rm(water_volume)
+
+# Read the star stress spreadsheet
+star_stress <- read_excel("Data/Star Stress Summary.xlsx")
+
+# Find columns matching the X_XX_X pattern (health check columns)
+health_check_cols <- grep("^[0-9]+_[0-9]+_[0-9]+$", names(star_stress), value = TRUE)
+
+# Create the binary TRUE/FALSE column for any stress indicator
+star_stress <- star_stress %>%
+  mutate(
+    Stress_Response = (`Addition Stress` == 1) |
+      (`Removal Stress` == 1) |
+      (rowSums(across(all_of(health_check_cols)) >= 2) > 0),
+    # Numerical stress score (sum of all stress columns minus baseline
+    # of number of health check columns)
+    Stress_Score = rowSums(across(all_of(c("Addition Stress", "Removal Stress", health_check_cols)))) -
+      length(health_check_cols)
+  ) %>%
+  rename(condition = `Star ID`)
+
+shedding_data <- shedding_data %>% left_join(star_stress, by = "condition")
+rm(star_stress)
+
+# Set up time points to plot
+shedding_data <- shedding_data %>%
+  mutate(time_ordered = match(hours_elapsed, sort(unique(hours_elapsed))) - 1)
+
+
+# Identify the final three timepoints
+final_three_times <- shedding_data %>%
+  distinct(hours_elapsed) %>%
+  arrange(desc(hours_elapsed)) %>%
+  slice(1:3) %>%
+  pull(hours_elapsed)
+
+# Add a column to identify final three timepoints
+shedding_data <- shedding_data %>%
+  mutate(is_final_three = hours_elapsed %in% final_three_times)
+
+# Function to convert date and time code to hours_elapsed
+convert_to_hours <- function(date_str, time_code) {
+  # Parse the date from column name (e.g., "9_16" from "9_16_1")
+  month_day <- str_extract(date_str, "\\d+_\\d+")
+  month <- as.numeric(str_split(month_day, "_")[[1]][1])
+  day <- as.numeric(str_split(month_day, "_")[[1]][2])
+  
+  # Calculate days from start (9/15)
+  days_elapsed <- day - 15
+  
+  # Convert time code to hours within day
+  hours_within_day <- case_when(
+    time_code == 1 ~ 9,   # 9am
+    time_code == 2 ~ 12,  # 12pm
+    time_code == 3 ~ 16   # 4pm
+  )
+  
+  # Calculate total hours from start (4pm on 9/15)
+  total_hours <- days_elapsed * 24 + (hours_within_day - 16)
+  
+  return(total_hours)
+}
+
+```
+
+```{r Figure 4}
+#NEED TO FORMAT
+
+# Reshape health check data to long format
+health_checks <- shedding_data %>%
+  select(size_rank, starts_with("9_")) %>%
+  distinct(size_rank, .keep_all = TRUE) %>%
+  pivot_longer(cols = starts_with("9_"), 
+               names_to = "check_time", 
+               values_to = "health_score") %>%
+  filter(!is.na(health_score)) %>%
+  mutate(
+    time_code = as.numeric(str_extract(check_time, "\\d$")),
+    date_part = str_extract(check_time, "\\d+_\\d+"),
+    hours_elapsed_check = map2_dbl(check_time, time_code, 
+                                   ~convert_to_hours(.x, .y))
+  )
+
+# Create Addition Stress data for rectangles (before hour 0)
+addition_stress_data <- shedding_data %>% 
+  filter(`Addition Stress` == 1) %>%
+  distinct(size_rank, .keep_all = TRUE) %>%
+  mutate(stress_indicator = "Stress Detected")
+
+# Create Removal Stress data for rectangles (after hour 72)
+removal_stress_data <- shedding_data %>% 
+  filter(`Removal Stress` == 1) %>%
+  distinct(size_rank, .keep_all = TRUE) %>%
+  mutate(stress_indicator = "Stress Detected")
+
+# Create the main plot
+Figure_4 <- ggplot(shedding_data, aes(x = hours_elapsed, y = copies_per_L)) +
+  # Add health check horizontal bands
+ geom_rect(data = health_checks,
+          aes(xmin = hours_elapsed_check - 1,
+              xmax = hours_elapsed_check + 1,
+              ymin = -50000, ymax = 1050000,
+              fill = as.factor(health_score)),
+          alpha = 0.2, inherit.aes = FALSE) +
+  # Add Addition Stress shading before hour 0
+  {if(nrow(addition_stress_data) > 0) {
+    geom_rect(data = addition_stress_data,
+            aes(xmin = -2.5, xmax = -0.5, ymin = -50000, ymax = 1050000,
+                fill = stress_indicator),
+            alpha = 0.2, inherit.aes = FALSE)
+  }} +
+  # Add Removal Stress shading after hour 72
+  {if(nrow(removal_stress_data) > 0) {
+   geom_rect(data = removal_stress_data,
+            aes(xmin = 73.5, xmax = 75.5, ymin = -50000, ymax = 1050000,
+                fill = stress_indicator),
+            alpha = 0.2, inherit.aes = FALSE)
+  }} +
+  # Original shedding data
+  geom_line(color = "black", linewidth = 1) +
+  # Add error bars
+  geom_errorbar(aes(ymin = total_conf_min_L, ymax = total_conf_max_L),
+                width = 1.5, linewidth = 0.5, color = "black") +
+  # Earlier points - no outline
+  geom_point(data = shedding_data %>% dplyr::filter(!is_final_three),
+             size = 2, color = "black") +
+  # Final three timepoints - orange outline
+  geom_point(data = shedding_data %>% dplyr::filter(is_final_three),
+             aes(color = "Concentrations Used in\nShedding Rate Calculation"),
+             size = 2, fill = "black", shape = 21, stroke = 1.5) +
+  scale_color_manual(values = c("Concentrations Used in\nShedding Rate Calculation" = "orange"),
+                     name = NULL) +
+  scale_fill_manual(values = c("1" = "green3", "2" = "orange", "3" = "red",
+                               "Stress Detected" = "mediumpurple"),
+                    labels = c("1" = "Score: 1\n(No Stress Detected)",
+                               "2" = "Score: 2",
+                               "3" = "Score: 3",
+                               "Stress Detected" = "Stress Detected During\nStar Addition or Removal"),
+                    name = "Health\nChecks") +
+  
+  # Y axis: 0–1,000,000 with only 3 ticks (min, mid, max) and math-style labels
+   scale_y_continuous(
+    breaks = c(0, 5e5, 1e6),
+    labels = format_sci_10
+  ) +
+  
+  facet_wrap(~size_rank, ncol = 4) +
+  
+  # Facet labels inside panels (top-left) with padding, using geom_label
+  geom_label(
+    data = dplyr::distinct(shedding_data, size_rank),
+    aes(x = -Inf, y = Inf, label = size_rank),
+    inherit.aes = FALSE,
+    hjust = 0, vjust = 1,
+    position = position_nudge(
+      x = 1.0,        # "hours" units
+      y = -0.05 * 1e6 # move down by 5% of the y-range
+    ),
+    size = 4.5,
+    fill = "white",
+    alpha = 0.7,
+    linewidth = 0
+  ) +
+  
+  labs(x = "Hours Elapsed",
+       y = bquote(italic("P. helianthoides")~"eDNA Concentration"~"(copies/L)")) +
+  theme_paper() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.key.height = unit(0.8, "cm"),
+    
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.line = element_line(linewidth = 1),
+    
+    axis.ticks = element_line(color = "black", linewidth = 1),
+    axis.ticks.length = unit(0.15, "cm")
+  ) + 
+   coord_cartesian(ylim = c(0, 1e6)) 
+
+
+star_icon_data <- shedding_data %>%
+  distinct(size_rank, star_UPD_size_mm) %>%
+  arrange(size_rank) %>%
+  mutate(
+    height_input = star_UPD_size_mm^2,
+    x_pos = if_else(size_rank >= 10, 8, 5),
+    y_pos = 950000
+  )
+
+Figure_4 <- Figure_4 +
+  geom_phylopic(
+    data = star_icon_data,
+    aes(x = x_pos, y = y_pos, height = height_input),
+    uuid = pycno_uuid,
+    hjust = 0,     # anchor LEFT edge of star at x_pos (grows rightward, not centered)
+    vjust = 1,     # anchor TOP edge of star at y_pos (grows downward, avoids clipping the panel top)
+    inherit.aes = FALSE,
+    color = "black"
+  ) +
+  scale_height_continuous(
+    range = c(0, 300000),   # reduced slightly from 400000 so the biggest stars don't crowd the data below
+    limits = c(0, max(star_icon_data$height_input)),
+    guide = "none"
+  )
+
+
+path = "Figures/Figure4."
+save_pdf_png(
+  plot = Figure_4,
+  path = path,
+  w = 169,
+  h = 140
+)
+
+
+```
+
+```{r Shedding Rates}
+#NEED TO FORMAT
+
+#Calculate steady state
+
+k  <- model_results_summary %>% filter(Condition == "All Combined") %>% pull(k)
+SE <- model_results_summary %>% filter(Condition == "All Combined") %>% pull(SE)
+
+# Filter for the specific time points
+steady_state_subset <- shedding_data[shedding_data$hours_elapsed %in% c(66, 69, 72), ]
+
+# Calculate shedding rates for each individual time point
+individual_rates <- steady_state_subset %>%
+  mutate(
+    shedding_rate = copies_per_L * volume * k,
+    shedding_rate_g = shedding_rate / star_weight_g,
+    size_rank = factor(size_rank)
+  )
+
+# Calculate the average-based shedding rate (your original approach)
+average_rates <- steady_state_subset %>%
+  group_by(star_name, size_rank, star_UPD_size_mm, star_weight_g, 
+           volume, Stress_Response, Stress_Score) %>%
+  summarise(
+    avg_copies_per_L = mean(copies_per_L, na.rm = TRUE),
+    sd_copies_per_L = sd(copies_per_L, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    rel_error = sqrt((SE/k)^2 + (sd_copies_per_L/avg_copies_per_L)^2),
+    shedding_rate = avg_copies_per_L * volume * k,
+    shedding_rate_SD = rel_error * shedding_rate,
+    shedding_rate_g = shedding_rate / star_weight_g,
+    shedding_rate_g_SD = rel_error * shedding_rate_g,
+    size_rank = factor(size_rank)
+  )
+
+# Summary statistics for shedding rates
+shedding_summary <- average_rates %>%
+  summarise(
+    # Shedding rate (per individual)
+    shedding_rate_min = min(shedding_rate, na.rm = TRUE),
+    shedding_rate_max = max(shedding_rate, na.rm = TRUE),
+    shedding_rate_mean = mean(shedding_rate, na.rm = TRUE),
+    shedding_rate_sd = sd(shedding_rate, na.rm = TRUE),
+    
+    # Shedding rate per gram
+    shedding_rate_g_min = min(shedding_rate_g, na.rm = TRUE),
+    shedding_rate_g_max = max(shedding_rate_g, na.rm = TRUE),
+    shedding_rate_g_mean = mean(shedding_rate_g, na.rm = TRUE),
+    shedding_rate_g_sd = sd(shedding_rate_g, na.rm = TRUE)
+  )
+
+# View the summary
+print(shedding_summary)
+
+# Random-intercept model: allows each individual to have its own baseline shedding rate
+mixed_model_individual <- lmer(shedding_rate ~ 1 + (1 | star_name), data = individual_rates)
+
+# ICC: proportion of total variance attributable to between-individual differences
+icc(mixed_model_individual)
+
+# Formal test of whether the individual random effect is significantly > 0
+# (likelihood ratio test comparing with vs. without the random intercept)
+library(lmerTest)  # or use ranova() from lmerTest for a formal p-value
+ranova(mixed_model_individual)
+
+# Random-intercept model: allows each individual to have its own baseline shedding rate
+mixed_model_biomass <- lmer(shedding_rate_g ~ 1 + (1 | star_name), data = individual_rates)
+
+# ICC: proportion of total variance attributable to between-individual differences
+icc(mixed_model_biomass)
+
+# Formal test of whether the individual random effect is significantly > 0
+# (likelihood ratio test comparing with vs. without the random intercept)
+library(lmerTest)  # or use ranova() from lmerTest for a formal p-value
+ranova(mixed_model_biomass)
+
+
+
+
+
+
+# =========================================================================
+# 2. BUILD MODEL DATA - biomass, UPD size, stress score, log outcomes
+# =========================================================================
+ 
+model_data <- average_rates %>%
+  mutate(
+    biomass = star_weight_g,
+    log_shedding_rate   = log(shedding_rate),      # requires shedding_rate > 0
+    log_shedding_rate_g = log(shedding_rate_g)      # requires shedding_rate_g > 0
+  )
+ 
+# =========================================================================
+# 3. MULTIPLE REGRESSION: log(shedding_rate) and log(shedding_rate_g)
+#    predicted by biomass + UPD size + stress score
+# =========================================================================
+ 
+# Check predictor-predictor collinearity first
+predictor_cor_matrix <- cor(
+  model_data[, c("biomass", "star_UPD_size_mm", "Stress_Score")],
+  use = "complete.obs"
+)
+cat("\n--- Predictor-predictor correlation matrix ---\n")
+print(round(predictor_cor_matrix, 2))
+ 
+final_model_raw <- lm(log_shedding_rate ~ biomass + star_UPD_size_mm + Stress_Score,
+                       data = model_data)
+final_model_norm <- lm(log_shedding_rate_g ~ biomass + star_UPD_size_mm + Stress_Score,
+                        data = model_data)
+ 
+cat("\n--- Multiple regression: log(shedding_rate) ---\n")
+print(summary(final_model_raw))
+cat("VIF:\n")
+print(vif(final_model_raw))
+ 
+cat("\n--- Multiple regression: log(shedding_rate_g) ---\n")
+print(summary(final_model_norm))
+cat("VIF:\n")
+print(vif(final_model_norm))
+
+```
+
+```{r Table 4}
+#NEED TO FORMAT
+
+# Table 4
+kable(average_rates %>% 
+        arrange(size_rank) %>%
+        select(size_rank, shedding_rate, shedding_rate_SD, 
+               shedding_rate_g, shedding_rate_g_SD, 
+               star_weight_g, star_UPD_size_mm, Stress_Score),
+  digits = c(0, 0, 0, 0, 0, 0, 0, 0), # No decimal places
+  col.names = c(
+    "Star",
+    "copies/hr",
+    "Propagated Standard Deviation",
+    "copies/hr/g",
+    "Propagated Standard Deviation",
+    "Biomass (g)",
+    "Tip-to-tip length (mm)",
+    "Stress Score"
+  ),
+  escape = FALSE
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  add_header_above(c(" " = 1, 
+                     "Shedding rate per individual" = 2,
+                     "Shedding rate per biomass" = 2,
+                     "Organism Characteristics" = 3))
+
+```
+
+```{r Figure 5}
+#NEED TO FORMAT 
+
+# Get sizes for smallest and largest individuals
+size_1 <- min(average_rates$star_UPD_size_mm, na.rm = TRUE)
+size_12 <- max(average_rates$star_UPD_size_mm, na.rm = TRUE)
+
+# Create scaling factor
+scale_factor <- size_12 / size_1
+
+# Create top plot (copies/hr/individual)
+p1 <- ggplot() +
+  geom_boxplot(data = individual_rates, 
+               aes(x = size_rank, y = shedding_rate, fill = Stress_Score, color = Stress_Score),
+               alpha = 0.3, linewidth = 0.8) +
+  geom_point(data = average_rates, 
+             aes(x = size_rank, y = shedding_rate, shape = "Average"),
+             color = "red", size = 3) +
+  panel_label("A") +
+  scale_fill_viridis_c(option = "viridis") +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(name = "", values = c("Average" = 18)) +
+  scale_y_continuous(labels = format_sci_10) +
+  labs(
+    y = "(copies/hr/individual)",
+    x = NULL
+  ) +
+  theme_paper() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_line(),
+        axis.line.x = element_line(),
+        legend.position = "none",
+        plot.margin = margin(5, 5, 5, 25))
+
+# Create bottom plot (copies/hr/g)
+p2 <- ggplot(individual_rates, aes(x = size_rank, y = shedding_rate_g)) +
+  geom_boxplot(aes(fill = Stress_Score, color = Stress_Score),
+               alpha = 0.3, linewidth = 0.8) +
+  geom_point(data = average_rates, 
+             aes(x = size_rank, y = shedding_rate_g, shape = "Average"),
+             color = "red", size = 3) +
+  panel_label("B", x = 0.5, hjust = 0) +
+  scale_fill_viridis_c(option = "viridis") +
+  scale_color_viridis_c(option = "viridis") +
+  scale_shape_manual(name = "", values = c("Average" = 18)) +
+  labs(
+    y = "(copies/hr/g)",
+    x = expression(italic("P. helianthoides")~"Individual"),
+    fill = "Stress Score",
+    color = "Stress Score"
+  ) +
+  theme_paper() +
+  theme(plot.margin = margin(5, 5, 70, 25))
+
+# Combine plots
+combined_plot <- p1 / p2 +
+  plot_layout(heights = c(1, 1), guides = "collect")
+
+# NEW: Create a function to draw Figure 5 with annotations
+# Create a function that returns a grob object instead of just printing
+draw_figure_5 <- function() {
+  # Create the main grob from the patchwork combined plot
+  main_grob <- patchworkGrob(combined_plot)
+  
+  # Create all annotation grobs
+  y_label_grob <- textGrob(expression(italic("P. helianthoides")~"eDNA Shedding Rate"), 
+                           x = 0.02, y = 0.58, rot = 90, 
+                           gp = gpar(fontsize = 14))
+  
+  arrow_grob <- linesGrob(x = c(0.24, 0.66), y = c(0.085, 0.085),
+                          arrow = arrow(length = unit(0.15, "inches"), type = "closed"),
+                          gp = gpar(lwd = 2, fill = "black"))
+  
+  img_grob_large <- rasterGrob(get_phylopic(pycno_uuid, format = "raster"), 
+                               x = 0.19, y = 0.085, height = 0.022, just = "center")
+  
+  img_grob_small <- rasterGrob(get_phylopic(pycno_uuid, format = "raster"), 
+                               x = 0.75, y = 0.085, height = 0.022 * scale_factor, just = "center")
+  
+  # Combine all grobs using grobTree (maintains layering)
+  final_grob <- grobTree(main_grob, 
+                         y_label_grob,
+                         arrow_grob,
+                         img_grob_large,
+                         img_grob_small)
+  
+  return(final_grob)
+}
+
+# Create the final figure (now returns a grob)
+Figure_5 <- draw_figure_5()
+
+# Save it
+path = "Figures/Figure5."
+save_pdf_png(
+  plot = Figure_5,
+  path = path,
+  w = 169,
+  h = 169
+)
+
+
+```
+
+```{r Literature Review, cache=TRUE, cache.extra = tools::md5sum(c("Decay_Rates_Summary.xlsx", "Shedding_Rates_Summary.xlsx"))}
+#NEED TO FORMAT
+
+
+
+# Function to get taxonomic information from GBIF with special cases
+get_taxonomy <- function(scientific_name) {
+  # Handle specific problematic genera
+  search_name <- scientific_name
+  
+  if (scientific_name == "Palaeomenes") {
+    search_name <- "Palaemonetes"
+  }
+  
+  # Use a lookup for phylum-specific searches
+  phylum_lookup <- list(
+    "Diplosoma" = "Chordata",
+    "Chrysaora" = "Cnidaria"
+  )
+  
+  if (search_name %in% names(phylum_lookup)) {
+    result <- name_backbone(name = search_name, phylum = phylum_lookup[[search_name]], verbose = TRUE)
+  } else {
+    result <- name_backbone(name = search_name, verbose = TRUE)
+  }
+  
+  # Helper function to safely extract fields
+  safe_extract <- function(field) {
+    ifelse(is.null(result[[field]]) || length(result[[field]]) == 0, NA, result[[field]])
+  }
+  
+  # Return a data frame with taxonomic info
+  data.frame(
+    scientific_name = scientific_name,
+    kingdom = safe_extract("kingdom"),
+    phylum = safe_extract("phylum"),
+    class = safe_extract("class"),
+    order = safe_extract("order"),
+    family = safe_extract("family"),
+    genus = safe_extract("genus"),
+    rank = safe_extract("rank"),
+    matchType = safe_extract("matchType"),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Function to process dataset (works for both decay and shedding data)
+process_dataset <- function(filepath, dataset_name) {
+  cat("\n==== Processing", dataset_name, "====\n")
+  
+  read_excel(filepath) %>%
+    mutate(
+      cleaned_scientific_name = trimws(gsub("spp\\.", "", `Organism Scientific Name`)),
+      Temperature = as.numeric(Temperature),
+      Study_Type = ifelse(Reference == "This study", "This study", "Literature")
+    ) %>%
+    # Convert Fragment length to numeric if it exists
+    {if ("Fragment length (bp)" %in% names(.)) 
+      mutate(., `Fragment length (bp)` = as.numeric(`Fragment length (bp)`)) 
+      else .}
+}
+
+# Simplified taxonomy retrieval with progress messages
+get_all_taxonomy <- function(species_vector, dataset_name = "data") {
+  cat("\n==== Querying GBIF for", length(species_vector), "taxa from", dataset_name, "====\n")
+  
+  taxonomy_df <- lapply(seq_along(species_vector), function(i) {
+    cat("Processing", i, "of", length(species_vector), ":", species_vector[i], "\n")
+    get_taxonomy(species_vector[i])
+  }) %>% bind_rows()
+  
+  cat("\nTaxonomic matches:\n")
+  print(taxonomy_df %>% select(scientific_name, rank, matchType, phylum, class))
+  
+  return(taxonomy_df)
+}
+
+# ==== LOAD AND PROCESS BOTH DATASETS ====
+
+decay_data_literature <- process_dataset("Decay_Rates_Summary.xlsx", "Decay Data")
+shedding_data_literature <- process_dataset("Shedding_Rates_Summary.xlsx", "Shedding Data")
+
+# ==== GET TAXONOMY FOR BOTH DATASETS ====
+
+all_unique_species <- unique(c(
+  decay_data_literature$cleaned_scientific_name,
+  shedding_data_literature$cleaned_scientific_name
+))
+
+taxonomy_df_all <- get_all_taxonomy(all_unique_species, "all datasets")
+
+# Merge taxonomy with both datasets
+decay_data_literature <- decay_data_literature %>%
+  left_join(taxonomy_df_all, by = c("cleaned_scientific_name" = "scientific_name"))
+
+shedding_data_literature <- shedding_data_literature %>%
+  left_join(taxonomy_df_all, by = c("cleaned_scientific_name" = "scientific_name"))
+
+# ==== CREATE UNIFIED PHYLUM LEVELS ====
+
+all_phyla <- sort(unique(c(
+  decay_data_literature$phylum[!is.na(decay_data_literature$phylum)],
+  shedding_data_literature$phylum[!is.na(shedding_data_literature$phylum)]
+)))
+
+cat("\nAll phyla across datasets:", paste(all_phyla, collapse = ", "), "\n")
+
+# Function to set phylum factor levels
+set_phylum_levels <- function(data, levels) {
+  mutate(data, phylum = factor(phylum, levels = levels))
+}
+
+decay_data_literature <- set_phylum_levels(decay_data_literature, all_phyla)
+shedding_data_literature <- set_phylum_levels(shedding_data_literature, all_phyla)
+
+# ==== CALCULATE GLOBAL TEMPERATURE RANGE ====
+
+temp_range <- range(c(decay_data_literature$Temperature, 
+                      shedding_data_literature$Temperature), 
+                    na.rm = TRUE)
+
+cat("\nGlobal temperature range:", temp_range[1], "to", temp_range[2], "°C\n")
+
+# ==== PREPARE SHEDDING DATA SUBSETS ====
+
+shedding_data_clean <- shedding_data_literature %>%
+  filter(!is.na(`Standardized Shedding Rate`), 
+         !is.na(`Standardized Shedding Rate Units`),
+         !is.na(`Organism Common Name`))
+
+data_per_individual <- shedding_data_clean %>%
+  filter(`Standardized Shedding Rate Units` == "copies/hr/individual") %>%
+  set_phylum_levels(all_phyla)
+
+data_per_gram <- shedding_data_clean %>%
+  filter(`Standardized Shedding Rate Units` == "copies/hr/g") %>%
+  set_phylum_levels(all_phyla)
+
+
+# ==== SUMMARY STATISTICS ====
+
+
+cat("\n==== SUMMARY STATISTICS (Literature only) ====\n\n")
+
+# Filter for literature data only
+decay_lit <- decay_data_literature %>% filter(Study_Type == "Literature")
+shedding_gram_lit <- data_per_gram %>% filter(Study_Type == "Literature")
+shedding_ind_lit <- data_per_individual %>% filter(Study_Type == "Literature")
+
+# Function to calculate and print summary stats
+print_summary <- function(data, value_col, metric_name, filter_desc = "All literature") {
+  values <- data[[value_col]][!is.na(data[[value_col]])]
+  
+  if (length(values) > 0) {
+    cat(sprintf("%s - %s:\n", filter_desc, metric_name))
+    cat(sprintf("  N = %d\n", length(values)))
+    cat(sprintf("  Range: %f to %f (%.2e to %.2e)\n", 
+                min(values), max(values), min(values), max(values)))
+    cat(sprintf("  Average: %f (%.2e)\n\n", mean(values), mean(values)))
+  } else {
+    cat(sprintf("%s - %s: No data\n\n", filter_desc, metric_name))
+  }
+}
+
+# 1. Overall decay rate statistics
+print_summary(decay_lit, "Decay Rate Constant (/hr)", "Decay Rate Constant (/hr)")
+
+# 2. Overall shedding rate (copies/hr/g)
+print_summary(shedding_gram_lit, "Standardized Shedding Rate", "Shedding Rate (copies/hr/g)")
+
+# 3. Overall shedding rate (copies/hr/individual)
+print_summary(shedding_ind_lit, "Standardized Shedding Rate", "Shedding Rate (copies/hr/individual)")
+
+# 4. Echinodermata - decay rate
+decay_echino <- decay_lit %>% filter(phylum == "Echinodermata")
+print_summary(decay_echino, "Decay Rate Constant (/hr)", 
+              "Decay Rate Constant (/hr)", "Echinodermata")
+
+# 5. Echinodermata - shedding rate (copies/hr/g)
+shedding_gram_echino <- shedding_gram_lit %>% filter(phylum == "Echinodermata")
+print_summary(shedding_gram_echino, "Standardized Shedding Rate", 
+              "Shedding Rate (copies/hr/g)", "Echinodermata")
+
+# 6. Echinodermata - shedding rate (copies/hr/individual)
+shedding_ind_echino <- shedding_ind_lit %>% filter(phylum == "Echinodermata")
+print_summary(shedding_ind_echino, "Standardized Shedding Rate", 
+              "Shedding Rate (copies/hr/individual)", "Echinodermata")
+
+# 7. Temperature-matched decay rates and shedding rates 
+
+temp_matched_summary <- function(lit_data, this_study_data, value_col, metric_name) {
+  this_study_temps <- this_study_data %>% filter(Study_Type == "This study") %>%
+    pull(Temperature) %>% na.omit()
+
+  if (length(this_study_temps) == 0) {
+    cat(sprintf("Temperature-matched %s: No 'This study' temperatures available\n\n", metric_name))
+    return(invisible(NULL))
+  }
+
+  matched <- lit_data %>%
+    filter(!is.na(Temperature)) %>%
+    filter(sapply(Temperature, function(t) any(abs(t - this_study_temps) <= 5)))
+
+  cat(sprintf("Temperature-matched (±5°C from This study temps: %s) - %s:\n",
+              paste(round(this_study_temps, 1), collapse = ", "), metric_name))
+  print_summary(matched, value_col, metric_name, "Temp-matched")
+}
+
+temp_matched_summary(decay_lit, decay_data_literature, "Decay Rate Constant (/hr)", "Decay Rate Constant (/hr)")
+temp_matched_summary(shedding_gram_lit, data_per_gram, "Standardized Shedding Rate", "Shedding Rate (copies/hr/g)")
+temp_matched_summary(shedding_ind_lit, data_per_individual, "Standardized Shedding Rate", "Shedding Rate (copies/hr/individual)")
+
+cat("==== END OF SUMMARY STATISTICS ====\n\n")
+
+
+```
+
+
+```{r Figure 6}
+#NEED TO FORMAT 
+
+# ==== DEFINE SHARED AESTHETIC ELEMENTS ====
+
+set.seed(28)
+
+# Shared geom parameters
+shared_boxplot_params <- list(
+  fill = "gray80",
+  alpha = 0.7,
+  outlier.shape = NA
+)
+
+shared_jitter_params <- list(
+  width = 0.2,
+  size = 3.5,
+  alpha = 0.8,
+  shape = 21
+)
+
+literature_stroke <- 0.3
+this_study_stroke <- 2
+
+# Shared scale parameters
+shared_fill_scale <- scale_fill_viridis_c(
+  option = "magma",
+  name = "Temperature (°C)",
+  limits = temp_range,
+  na.value = "gray50",
+  guide = guide_colorbar(
+    direction = "horizontal",
+    title.position = "top",
+    barwidth = 10,
+    barheight = 1
+  )
+)
+
+shared_color_scale <- scale_color_manual(
+  values = c("This study" = "yellow", "Literature" = "black"),
+  name = "Source",
+  guide = guide_legend(
+    override.aes = list(
+      fill = "gray50",
+      stroke = c(literature_stroke, this_study_stroke),
+      size = 4
+    ),
+    direction = "horizontal",
+    title.position = "top"
+  )
+)
+
+shared_x_scale <- scale_x_discrete(drop = FALSE)
+
+# ==== HELPER FUNCTIONS ====
+
+# Function to create jitter layers for both study types
+add_jitter_layer <- function(data, show_legend = TRUE) {
+  data <- data %>% mutate(point_stroke = ifelse(Study_Type == "This study", this_study_stroke, literature_stroke))
+  do.call(geom_jitter, c(
+    list(
+      data = data,
+      mapping = aes(fill = Temperature, color = Study_Type, stroke = point_stroke),
+      show.legend = show_legend
+    ),
+    shared_jitter_params
+  ))
+}
+
+# Function to create base plot structure
+create_base_plot <- function(data, y_var, y_label, hide_x_axis = TRUE, log_scale = FALSE) {
+  p <- ggplot(data, aes(x = phylum, y = .data[[y_var]])) +
+    do.call(geom_boxplot, shared_boxplot_params) +
+    shared_x_scale +
+    shared_fill_scale +
+    shared_color_scale +
+    theme_paper() +
+    theme(
+      axis.title.y = element_text(face = "bold"),
+      legend.position = "bottom",
+      legend.box = "horizontal"
+    ) +
+    labs(y = y_label)
+  
+  # Add log scale if needed
+  if (log_scale) {
+    p <- p + scale_y_log10(labels = scales::label_log())
+  }
+  
+  # Hide x-axis if needed
+  if (hide_x_axis) {
+    p <- p + theme(
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+  } else {
+    p <- p + 
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(x = "Phylum")
+  }
+  
+  return(p)
+}
+
+# ==== CREATE THE THREE PLOTS ====
+
+# Plot 1: Decay rates
+plot_decay <- create_base_plot(
+  data = decay_data_literature,
+  y_var = "Decay Rate Constant (/hr)",
+  y_label = expression(atop(bold("Decay Rate Constant"), textstyle("(hr"^{-1}*")"))),  # CHANGED
+  hide_x_axis = TRUE,
+  log_scale = TRUE
+) +
+  add_jitter_layer(decay_data_literature, show_legend = TRUE) +
+  panel_label("A")
+
+# Plot 2: Shedding per gram
+plot_per_gram <- create_base_plot(
+  data = data_per_gram,
+  y_var = "Standardized Shedding Rate",
+  y_label = expression(atop(bold("Shedding Rate"), textstyle("(copies/hr/g)"))),  # CHANGED
+  hide_x_axis = TRUE,
+  log_scale = TRUE
+) +
+  add_jitter_layer(data_per_gram, show_legend = FALSE) +
+  panel_label("B")
+
+# Plot 3: Shedding per individual
+plot_per_individual <- create_base_plot(
+  data = data_per_individual,
+  y_var = "Standardized Shedding Rate",
+  y_label = expression(atop(bold("Shedding Rate"), textstyle("(copies/hr/individual)"))),  # CHANGED
+  hide_x_axis = FALSE,
+  log_scale = TRUE
+) +
+  add_jitter_layer(data_per_individual, show_legend = FALSE) +
+  panel_label("C")
+
+# Combine plots using patchwork with legends at bottom
+Figure_6 <- plot_decay / plot_per_gram / plot_per_individual + 
+  plot_layout(guides = 'collect') &
+  theme(legend.position = "bottom",
+        legend.box = "horizontal")
+
+path = "Figures/Figure6."
+save_pdf_png(
+  plot = Figure_6,
+  path = path,
+  w = 169,
+  h = 200
+)
+
+```
+
+
+```{r, Supplemental Material - UVA/UVB}
+# ============================================================================
+# SETUP
+# ============================================================================
+
+WAVELENGTH_RANGES <- list(
+  UVB = c(280, 315),
+  UVA = c(316, 400),
+  UV_COMBINED = c(280, 400)
+)
+
+in_range <- function(wavelength, range) {
+  wavelength >= range[1] & wavelength <= range[2]
+}
+
+filter_wavelength <- function(data, range) {
+  data %>%
+    filter(wavelength_nm >= range[1] & wavelength_nm <= range[2])
+}
+
+# ============================================================================
+# SECTION 1: DAILY AVERAGE UVA AND UVB IRRADIANCE (MEASURED AT SURFACE)
+# Irradiance from 280-315 nm is summed to get UVB and 316-400 nm to get UVA.
+# Night-time hours (no measurements) are filled with irradiance = 0 before
+# averaging, then daily averages are taken across all points for that day.
+# -> Figure S1
+# ============================================================================
+
+## 1a. Read field radiometer data --------------------------------------------
+radiometer_data <- dir_ls("Data/Radiometer", regexp = "\\.csv$") %>%
+  map_df(function(file) {
+    filename <- path_file(file) %>% str_remove("\\.csv$")
+    parts <- str_split(filename, "_")[[1]]
+    read_tsv(file, skip = 10,
+             col_names = c("wavelength_nm", "irradiance_W_m2"),
+             col_types = "dd") %>%
+      mutate(
+        irradiance_W_m2 = irradiance_W_m2 / 100,  # Convert from uW/cm2 to W/m2
+        date = parts[1],
+        time = parts[2],
+        condition = parts[3],
+        filename = filename,
+        .before = wavelength_nm
+      )
+  })
+
+## 1b. Fill each day's time series with zero-irradiance points for the
+##     unsampled night-time hours, before and after the day's measurements --
+complete_time_series <- function(summary_data, uv_type) {
+  irradiance_col <- names(summary_data)[grep("irradiance", names(summary_data))][1]
+
+  all_conditions <- summary_data %>%
+    distinct(condition) %>%
+    pull(condition)
+
+  complete_list <- map_df(all_conditions, function(cond) {
+    summary_cond <- summary_data %>%
+      filter(condition == cond)
+
+    complete_df <- summary_cond %>%
+      group_by(date) %>%
+      mutate(
+        time_diffs = c(NA, as.numeric(difftime(time[-1], time[-n()], units = "mins"))),
+        sampling_freq_mins = median(time_diffs, na.rm = TRUE),
+        min_time = min(time),
+        max_time = max(time),
+      ) %>%
+      ungroup() %>%
+      filter(!is.na(sampling_freq_mins)) %>%
+      nest(data = -date) %>%
+      mutate(
+        complete_data = map2(data, date, function(df, date_val) {
+          sampling_freq <- df$sampling_freq_mins[1]
+          min_t_secs <- as.numeric(df$min_time[1], units = "secs")
+          max_t_secs <- as.numeric(df$max_time[1], units = "secs")
+          sampling_freq_secs <- sampling_freq * 60
+          day_start_secs <- 0
+          day_end_secs <- 86399
+
+          # Times BEFORE the first measurement
+          times_before_secs <- if (min_t_secs - sampling_freq_secs > day_start_secs) {
+            seq(day_start_secs, min_t_secs - sampling_freq_secs, by = sampling_freq_secs)
+          } else {
+            numeric(0)
+          }
+          times_before <- hms::as_hms(times_before_secs)
+
+          # Times AFTER the last measurement
+          times_after_secs <- if (max_t_secs + sampling_freq_secs <= day_end_secs) {
+            seq(max_t_secs + sampling_freq_secs, day_end_secs, by = sampling_freq_secs)
+          } else {
+            numeric(0)
+          }
+          times_after <- hms::as_hms(times_after_secs)
+
+          # Combine: before times (zeros) + original measurements + after times (zeros)
+          bind_rows(
+            tibble(time = times_before,
+                   !!sym(irradiance_col) := 0,
+                   data_type = "Time Series Extended with 0 Irradiance"),
+            df %>% select(time, all_of(irradiance_col)) %>%
+              mutate(data_type = "Original measurement"),
+            tibble(time = times_after,
+                   !!sym(irradiance_col) := 0,
+                   data_type = "Time Series Extended with 0 Irradiance")
+          ) %>%
+            arrange(time)
+        })
+      ) %>%
+      unnest(complete_data) %>%
+      select(date, time, all_of(irradiance_col), data_type) %>%
+      mutate(condition = cond)
+
+    complete_df
+  })
+
+  complete_list
+}
+
+## 1c. Sum irradiance within a wavelength range, optionally apply per-
+##     wavelength attenuation and/or absorption adjustments (used again in
+##     Sections 2 and 3 once those adjustment tables exist), complete each
+##     day's time series (1b), and compute daily averages -------------------
+process_uv <- function(radiometer_data, wavelength_range, uv_type,
+                        attenuation_table = NULL, absorption_table = NULL,
+                        apply_attenuation = FALSE, apply_absorption = FALSE) {
+
+  filtered_data <- radiometer_data %>%
+    filter_wavelength(wavelength_range)
+
+  # STEP 1: attenuation adjustment (pouch vs. sunlight, per wavelength)
+  if (apply_attenuation && !is.null(attenuation_table)) {
+    filtered_data <- filtered_data %>%
+      left_join(
+        attenuation_table %>% select(wavelength_nm, attenuation_factor),
+        by = "wavelength_nm"
+      ) %>%
+      mutate(
+        attenuation_factor = replace_na(attenuation_factor, 1),
+        irradiance_W_m2 = irradiance_W_m2 * attenuation_factor
+      )
+
+    n_unmatched <- sum(is.na(filtered_data$attenuation_factor))
+    if (n_unmatched > 0) {
+      print(paste(uv_type, "- warning:", n_unmatched,
+                   "rows had no matching wavelength in the attenuation adjustment table (factor = 1 applied)"))
+    }
+  }
+
+  # STEP 2: absorption / light-screening adjustment, applied on top of
+  # whatever irradiance_W_m2 currently holds (i.e. sequentially after the
+  # attenuation adjustment above, if that was also applied)
+  if (apply_absorption && !is.null(absorption_table)) {
+    filtered_data <- filtered_data %>%
+      left_join(
+        absorption_table %>% select(wavelength_nm, light_screening_factor),
+        by = "wavelength_nm"
+      ) %>%
+      mutate(
+        light_screening_factor = replace_na(light_screening_factor, 1),
+        irradiance_W_m2 = irradiance_W_m2 * light_screening_factor
+      )
+
+    n_unmatched <- sum(is.na(filtered_data$light_screening_factor))
+    if (n_unmatched > 0) {
+      print(paste(uv_type, "- warning:", n_unmatched,
+                   "rows had no matching wavelength in the absorption adjustment table (factor = 1 applied)"))
+    }
+  }
+
+  # Summary built from the already-adjusted, per-wavelength data
+  summary_data <- filtered_data %>%
+    group_by(date, time, condition) %>%
+    summarise(irradiance_sum = sum(irradiance_W_m2), .groups = "drop") %>%
+    mutate(time = parse_time(time, format = "%H%M")) %>%
+    arrange(date, time, condition) %>%
+    rename(!!sym(paste0(tolower(uv_type), "_irradiance_sum")) := irradiance_sum)
+
+  irradiance_col <- names(summary_data)[grep("irradiance", names(summary_data))]
+
+  complete_data_adjusted <- complete_time_series(summary_data, uv_type)
+
+  daily_average <- complete_data_adjusted %>%
+    group_by(date, condition) %>%
+    summarise(
+      mean_irradiance = mean(!!sym(irradiance_col)),
+      n_measurements = sum(data_type == "Original measurement"),
+      n_filled_zeros = sum(data_type == "Time Series Extended with 0 Irradiance"),
+      .groups = "drop"
+    ) %>%
+    rename(!!sym(paste0("mean_", tolower(uv_type), "_irradiance")) := mean_irradiance) %>%
+    arrange(date, condition)
+
+  adjustment_label <- if (apply_attenuation && apply_absorption) {
+    " (Attenuation + Absorption Adjusted)"
+  } else if (apply_attenuation) {
+    " (Attenuation Adjusted)"
+  } else if (apply_absorption) {
+    " (Absorption Adjusted)"
+  } else {
+    ""
+  }
+  print(paste(uv_type, "Daily averages", adjustment_label, ":"))
+  print(daily_average)
+
+  mean_col <- names(daily_average)[grep("^mean_", names(daily_average))][1]
+  light_means <- daily_average %>% filter(condition == "Light") %>% pull(!!sym(mean_col))
+  dark_means  <- daily_average %>% filter(condition == "Dark")  %>% pull(!!sym(mean_col))
+
+  if (length(light_means) > 0) {
+    print(paste(uv_type, "Light - Overall mean of daily averages:", round(mean(light_means, na.rm = TRUE), 2)))
+  }
+  if (length(dark_means) > 0) {
+    print(paste(uv_type, "Dark - Overall mean of daily averages:", round(mean(dark_means, na.rm = TRUE), 2)))
+  }
+  print("---")
+
+  list(
+    summary = summary_data,
+    complete = complete_data_adjusted,
+    daily_average = daily_average
+  )
+}
+
+## 1d. Unadjusted ("Measured at Surface") daily averages for UVB and UVA ----
+uvb_results <- process_uv(radiometer_data, WAVELENGTH_RANGES$UVB, "UVB")
+uva_results <- process_uv(radiometer_data, WAVELENGTH_RANGES$UVA, "UVA")
+
+## 1e. Figure S1: UVA (A) / UVB (B) irradiance across the day, with
+##     night-time zero-irradiance points shown as open circles --------------
+condition_colors <- c("Light" = "#CCBB44", "Dark" = "#4477AA")
+
+parse_paper_date <- function(x) {
+  # e.g. "15Sept2025" -> Date (day + non-standard 4-letter month + year)
+  as.Date(sub("Sept", "Sep", x), format = "%d%b%Y")
+}
+
+add_datetime <- function(df) {
+  # Collapse date + time-of-day into one continuous POSIXct, sorted
+  # chronologically so lines connect points in the right order
+  df %>%
+    mutate(
+      date = parse_paper_date(date),
+      time_of_day = format(as.POSIXct(time), "%H:%M:%S"),
+      datetime = as.POSIXct(paste(date, time_of_day),
+                             format = "%Y-%m-%d %H:%M:%S",
+                             tz = "UTC")
+    ) %>%
+    select(-time_of_day) %>%
+    arrange(datetime)
+}
+
+draw_light_on_top <- function(df) {
+  # ggplot draws points in row order; put Dark first, Light last so Light
+  # sits on top whenever the two overlap
+  df %>%
+    mutate(condition = factor(condition, levels = c("Dark", "Light"))) %>%
+    arrange(condition)
+}
+
+# tick_interval  - spacing of the time-of-day ticks, e.g. "2 hours"
+# panel_letter   - passed to panel_label(), e.g. "A"
+# show_date_axis - draws the day-separator/date sub-axis beneath the x-axis
+#                  (only needed once, on the bottom-most panel)
+make_irradiance_plot <- function(data, y_var, y_label,
+                                  tick_interval = "3 hours",
+                                  panel_letter = NULL,
+                                  show_date_axis = TRUE) {
+
+  y_max <- max(data[[y_var]], na.rm = TRUE)
+  y_min <- 0
+  y_range <- y_max - y_min
+
+  original_pts <- data %>% filter(data_type == "Original measurement") %>% draw_light_on_top()
+  extended_pts <- data %>% filter(data_type == "Time Series Extended with 0 Irradiance") %>% draw_light_on_top()
+
+  # Anchor tick breaks to midnight of the first day, not to whatever time
+  # the data happens to start at
+  axis_start <- as.POSIXct(format(min(data$datetime), "%Y-%m-%d"), tz = "UTC")
+  axis_end   <- as.POSIXct(format(max(data$datetime), "%Y-%m-%d"), tz = "UTC") + 86400
+  time_breaks <- seq(axis_start, axis_end, by = tick_interval)
+
+  p <- ggplot(data, aes(x = datetime, y = .data[[y_var]], color = condition)) +
+    geom_line(aes(group = condition), alpha = 1) +
+    geom_point(
+      data = original_pts,
+      aes(shape = "Original measurement",
+          fill = after_scale(alpha(colour, 0.5))),
+      size = 2, stroke = 1
+    ) +
+    geom_point(
+      data = extended_pts,
+      aes(shape = "Time Series Extended with 0 Irradiance"),
+      fill = NA, alpha = 1, size = 2, stroke = 1
+    ) +
+    scale_color_manual(values = condition_colors, name = "Condition") +
+    scale_shape_manual(
+      values = c("Original measurement" = 21,
+                 "Time Series Extended with 0 Irradiance" = 1),
+      labels = c("Original measurement" = "Original measurement",
+                 "Time Series Extended with 0 Irradiance" = "Time Series Extended\n(Irradiance = 0)"),
+      name = "Data Type"
+    ) +
+    scale_x_datetime(breaks = time_breaks, labels = format(time_breaks, "%H:%M")) +
+    # No `limits` here: scale limits silently drop data (and the below-axis
+    # annotations added further down); the 0..y_max view is enforced via
+    # coord_cartesian() instead.
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 4)) +
+    labs(x = NULL, y = y_label) +
+    theme_paper()
+
+  if (!is.null(panel_letter)) {
+    p <- p + panel_label(panel_letter)
+  }
+
+  p <- p + coord_cartesian(ylim = c(y_min, y_max), clip = "on")
+
+  if (show_date_axis) {
+    dates_present <- sort(unique(data$date))
+    n_days <- length(dates_present)
+    day_starts <- as.POSIXct(dates_present, tz = "UTC")
+    day_ends   <- as.POSIXct(dates_present + 1, tz = "UTC")
+    day_starts[1]    <- min(data$datetime)
+    day_ends[n_days] <- axis_end
+
+    day_spans <- tibble(
+      date = dates_present,
+      x_min = day_starts,
+      x_max = day_ends
+    ) %>%
+      mutate(
+        x_center = x_min + (x_max - x_min) / 2,
+        day_label = paste0("Day ", row_number()),
+        date_label = format(date, "%d %B %Y")
+      )
+
+    # Fractions of this panel's y-range, scaled for h ~= 120mm (see
+    # save_pdf_png call below); rescale if that height changes.
+    tick_top_y     <- y_min - y_range * 0.30
+    bracket_line_y <- y_min - y_range * 0.40
+    day_label_y    <- y_min - y_range * 0.47   # "Day N", bold
+    date_label_y   <- y_min - y_range * 0.58   # date, plain
+    time_label_y   <- y_min - y_range * 0.82   # "Local Time (GMT-7)"
+
+    end_ticks <- tibble(x = c(day_spans$x_min, day_spans$x_max))
+
+    p <- p +
+      geom_segment(
+        data = day_spans,
+        aes(x = x_min, xend = x_max, y = bracket_line_y, yend = bracket_line_y),
+        inherit.aes = FALSE, color = "grey30", linewidth = 0.4
+      ) +
+      geom_segment(
+        data = end_ticks,
+        aes(x = x, xend = x, y = bracket_line_y, yend = tick_top_y),
+        inherit.aes = FALSE, color = "grey30", linewidth = 0.4
+      ) +
+      geom_text(
+        data = day_spans,
+        aes(x = x_center, y = day_label_y, label = day_label),
+        inherit.aes = FALSE, hjust = 0.5, vjust = 1,
+        size = 3.2, fontface = "bold", color = "black"
+      ) +
+      geom_text(
+        data = day_spans,
+        aes(x = x_center, y = date_label_y, label = date_label),
+        inherit.aes = FALSE, hjust = 0.5, vjust = 1,
+        size = 3.0, fontface = "plain", color = "black"
+      ) +
+      annotate(
+        "text",
+        x = mean(range(data$datetime)), y = time_label_y,
+        label = "Local Time (GMT-7)",
+        hjust = 0.5, vjust = 1, size = theme_font_sizes$axis_labels / 2.8
+      ) +
+      coord_cartesian(ylim = c(y_min, y_max), clip = "off") +
+      theme(plot.margin = margin(t = 5.5, r = 5.5, b = 40, l = 5.5))
+  }
+
+  p
+}
+
+uvb_complete <- add_datetime(uvb_results$complete)
+uva_complete <- add_datetime(uva_results$complete)
+
+uva_panel <- make_irradiance_plot(
+  data = uva_complete,
+  y_var = "uva_irradiance_sum",
+  y_label = "UVA Irradiance\n(W/m\u00b2)",
+  tick_interval = "6 hours",
+  panel_letter = "A",
+  show_date_axis = FALSE
+) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    # theme_paper() may fix a height:width ratio for standalone figures;
+    # override it here so this panel can freely fill the combined figure
+    aspect.ratio = NULL
+  )
+
+uvb_panel <- make_irradiance_plot(
+  data = uvb_complete,
+  y_var = "uvb_irradiance_sum",
+  y_label = "UVB Irradiance\n(W/m\u00b2)",
+  tick_interval = "6 hours",
+  panel_letter = "B",
+  show_date_axis = TRUE
+) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), aspect.ratio = NULL)
+
+Figure_S1 <- (uva_panel / uvb_panel / guide_area()) +
+  plot_layout(
+    guides = "collect",
+    heights = grid::unit.c(unit(1, "null"), unit(1, "null"), unit(1.4, "cm"))
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.justification = c(0, 0.5),
+    legend.key.size = unit(0.7, "lines"),
+    legend.box.spacing = unit(2, "pt"),
+    legend.spacing.x = unit(4, "pt"),
+    legend.box.margin = margin(0, 0, 0, 0),
+    legend.margin = margin(0, 0, 0, 0)
+  ) &
+  guides(
+    color = guide_legend(order = 1, nrow = 1, keyheight = unit(1.8, "lines")),
+    shape = guide_legend(order = 2, nrow = 1, keyheight = unit(1.8, "lines"))
+  )
+
+save_pdf_png(
+  plot = Figure_S1,
+  path = "Figures/FigureS1.",
+  w = 169, h = 120
+)
+
+# ============================================================================
+# SECTION 2: ATTENUATION OF UVA/UVB BY THE POUCH MATERIAL (Equations S1-S2)
+# Attenuation factor derived by comparing incident sunlight irradiance to
+# sunlight irradiance after passing through the pouch material.
+# -> Figure S2
+# ============================================================================
+
+## 2a. Read the pouch-vs-sunlight radiometer test data -----------------------
+radiometer_test_data <- dir_ls("Data/Radiometer Test", regexp = "\\.csv$") %>%
+  map_df(function(file) {
+    filename <- path_file(file) %>% str_remove("\\.csv$")
+    parts <- str_split(filename, "_")[[1]]
+    read_tsv(file, skip = 10,
+             col_names = c("wavelength_nm", "irradiance_W_m2"),
+             col_types = "dd") %>%
+      mutate(
+        irradiance_W_m2 = irradiance_W_m2 / 100,  # Convert from uW/cm2 to W/m2
+        date = parts[3],
+        material = parts[2],
+        filename = filename,
+        .before = wavelength_nm
+      )
+  })
+
+## 2b. Equation S1: per-wavelength attenuation factor ------------------------
+attenuation_adjustment <- radiometer_test_data %>%
+  group_by(material, wavelength_nm) %>%
+  summarise(irradiance_W_m2 = mean(irradiance_W_m2), .groups = "drop") %>%
+  pivot_wider(names_from = material, values_from = irradiance_W_m2) %>%
+  mutate(
+    percent_diff = ((pouch - sunlight) / sunlight) * 100,
+    attenuation_factor = 1 + percent_diff / 100
+  ) %>%
+  arrange(wavelength_nm)
+
+print("Attenuation adjustment (per-wavelength percent difference / adjustment factors):")
+print(attenuation_adjustment)
+
+## 2c. Apply the attenuation factor to the field measurements to get
+##     "Passing Through Pouch" irradiance (used later in Table S1) ----------
+uvb_results_attenuation_only <- process_uv(
+  radiometer_data, WAVELENGTH_RANGES$UVB, "UVB",
+  attenuation_table = attenuation_adjustment,
+  apply_attenuation = TRUE
+)
+uva_results_attenuation_only <- process_uv(
+  radiometer_data, WAVELENGTH_RANGES$UVA, "UVA",
+  attenuation_table = attenuation_adjustment,
+  apply_attenuation = TRUE
+)
+
+## 2d. Equation S2: percent attenuation averaged across each spectrum
+##     (reported in text as 14% UVA / 16.7% UVB) -----------------------------
+uv_summary <- bind_rows(
+  radiometer_test_data %>%
+    filter_wavelength(WAVELENGTH_RANGES$UVB) %>%
+    group_by(material) %>%
+    summarise(irradiance_sum = sum(irradiance_W_m2), .groups = "drop") %>%
+    mutate(wavelength_range = "UVB"),
+  radiometer_test_data %>%
+    filter_wavelength(WAVELENGTH_RANGES$UVA) %>%
+    group_by(material) %>%
+    summarise(irradiance_sum = sum(irradiance_W_m2), .groups = "drop") %>%
+    mutate(wavelength_range = "UVA"),
+  radiometer_test_data %>%
+    filter_wavelength(WAVELENGTH_RANGES$UV_COMBINED) %>%
+    group_by(material) %>%
+    summarise(irradiance_sum = sum(irradiance_W_m2), .groups = "drop") %>%
+    mutate(wavelength_range = "UVA + UVB"),
+  radiometer_test_data %>%
+    group_by(material) %>%
+    summarise(irradiance_sum = sum(irradiance_W_m2), .groups = "drop") %>%
+    mutate(wavelength_range = "Total")
+)
+
+percent_diff <- uv_summary %>%
+  pivot_wider(names_from = material, values_from = irradiance_sum) %>%
+  mutate(
+    percent_diff = round(((pouch - sunlight) / sunlight) * 100, 2)
+  ) %>%
+  select(wavelength_range, pouch, sunlight, percent_diff)
+
+print("Percent difference:")
+print(percent_diff)
+
+## 2e. Figure S2: measured irradiance of incident sunlight vs. sunlight
+##     passing through the pouch (full spectrum, with UVA+UVB inset) --------
+material_labels <- c(
+  "pouch" = "Enteral Feeding Pouch",
+  "sunlight" = "Control (Direct Sunlight)"
+)
+material_colors <- c("pouch" = "#1f77b4", "sunlight" = "#ff7f0e")
+
+y_limits <- radiometer_test_data %>%
+  filter_wavelength(WAVELENGTH_RANGES$UV_COMBINED) %>%
+  summarise(ymin = min(irradiance_W_m2), ymax = max(irradiance_W_m2))
+
+plot_full <- ggplot(radiometer_test_data, aes(x = wavelength_nm, y = irradiance_W_m2,
+                                               color = material)) +
+  geom_line(linewidth = 1) +
+  annotate("rect",
+           xmin = WAVELENGTH_RANGES$UV_COMBINED[1],
+           xmax = WAVELENGTH_RANGES$UV_COMBINED[2],
+           ymin = y_limits$ymin,
+           ymax = y_limits$ymax,
+           alpha = 0, color = "black", linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = material_colors, labels = material_labels) +
+  labs(x = "Wavelength (nm)", y = "Irradiance (W/m\u00b2)", color = "Material") +
+  theme_paper() +
+  theme(legend.position = "none")
+
+plot_uv <- radiometer_test_data %>%
+  filter_wavelength(WAVELENGTH_RANGES$UV_COMBINED) %>%
+  ggplot(aes(x = wavelength_nm, y = irradiance_W_m2, color = material)) +
+  geom_line(linewidth = 1) +
+  coord_cartesian(ylim = c(y_limits$ymin, y_limits$ymax)) +
+  scale_color_manual(values = material_colors, labels = material_labels) +
+  labs(
+    title = "UVA + UVB Wavelengths",
+    x = "Wavelength (nm)",
+    y = "Irradiance (W/m\u00b2)"
+  ) +
+  theme_paper() +
+  theme(
+    legend.position = "none",
+    panel.border = element_rect(color = "black", fill = NA, linetype = "dashed", linewidth = 1),
+    plot.title = element_text(size = 9)
+  )
+
+legend_plot <- ggplot(radiometer_test_data, aes(x = wavelength_nm, y = irradiance_W_m2,
+                                                 color = material)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = material_colors, labels = material_labels) +
+  labs(color = "Material") +
+  theme_paper() +
+  theme(legend.position = "right")
+
+extracted_legend <- cowplot::get_legend(legend_plot)
+
+Figure_S2 <- (plot_full) /
+  ((plot_uv | extracted_legend) + plot_layout(widths = c(0.65, 0.35)))
+
+save_pdf_png(
+  plot = Figure_S2,
+  path = "Figures/FigureS2.",
+  w = 169, h = 110
+)
+
+# ============================================================================
+# SECTION 3: DEPTH-AVERAGED IRRADIANCE ACCOUNTING FOR LIGHT SCREENING
+# Following Anderson & Boehm (2023): a modified Beer's Law light-screening
+# factor, from spectrophotometer absorbance data, applied on top of the
+# attenuation-adjusted irradiance from Section 2.
+# -> Figure S3
+# ============================================================================
+
+## 3a. Read spectrophotometer absorbance data --------------------------------
+Z_CONSTANT <- 0.058  # estimated pouch depth (m) when full and floating in water
+CUVETTE_WIDTH <- 0.01  # cuvette path length (m)
+
+absorbance_data <- suppressWarnings(
+  read_csv(
+    "Data/Spectrophotometer/PycnoGraham.csv",
+    col_names = c("wavelength_nm_raw", "absorbance", "extra"),
+    col_types = "ddc",
+    skip = 1
+  )
+) %>%
+  # Drop the trailing metadata block: those rows fail to parse as numeric
+  # wavelength/absorbance and come through as NA
+  select(wavelength_nm_raw, absorbance) %>%
+  filter(!is.na(wavelength_nm_raw), !is.na(absorbance)) %>%
+  # This instrument doesn't report whole-number wavelengths, so round to
+  # the nearest nm to match the radiometer data
+  mutate(wavelength_nm = round(wavelength_nm_raw)) %>%
+  group_by(wavelength_nm) %>%
+  summarise(absorbance = mean(absorbance), .groups = "drop") %>%
+  arrange(wavelength_nm) %>%
+  # Convert raw absorbance to an absorption coefficient by normalizing out
+  # the cuvette path length
+  mutate(absorption_coefficient = absorbance / CUVETTE_WIDTH)
+
+## 3b. Equation S3: light-screening factor per wavelength (modified Beer's Law)
+##     factor = (1 - 10^(-a * z)) / (2.303 * a * z)
+##     where a = absorption coefficient (absorbance / cuvette width)
+##     NOTE: assuming standard parenthesization of this formula (the
+##     well-known self-shading/light-screening correction) -- double check
+##     this matches what you intended before relying on the output.
+absorption_adjustment <- absorbance_data %>%
+  mutate(
+    light_screening_factor = (1 - 10^(-absorption_coefficient * Z_CONSTANT)) / (2.303 * absorption_coefficient * Z_CONSTANT)
+  )
+
+print("Absorption adjustment (per-wavelength light-screening factors):")
+print(absorption_adjustment)
+
+## 3c. Apply attenuation *and* light-screening adjustments sequentially to
+##     get "Depth-Averaged within Pouch" irradiance (used in Table S1) ------
+uvb_results_adjusted <- process_uv(
+  radiometer_data, WAVELENGTH_RANGES$UVB, "UVB",
+  attenuation_table = attenuation_adjustment,
+  absorption_table = absorption_adjustment,
+  apply_attenuation = TRUE,
+  apply_absorption = TRUE
+)
+uva_results_adjusted <- process_uv(
+  radiometer_data, WAVELENGTH_RANGES$UVA, "UVA",
+  attenuation_table = attenuation_adjustment,
+  absorption_table = absorption_adjustment,
+  apply_attenuation = TRUE,
+  apply_absorption = TRUE
+)
+
+## 3d. Figure S3: measured vs. attenuation-adjusted vs. depth-averaged
+##     irradiance by wavelength, for one example measurement ----------------
+target_date <- "15Sept2025"  # <-- adjust to match your filename format
+target_time <- "0907"        # <-- adjust to match your filename format
+
+spectrum_check <- radiometer_data %>%
+  filter(condition == "Light",
+         date == target_date,
+         time == target_time) %>%
+  filter_wavelength(WAVELENGTH_RANGES$UV_COMBINED) %>%
+  left_join(attenuation_adjustment %>% select(wavelength_nm, attenuation_factor), by = "wavelength_nm") %>%
+  left_join(absorption_adjustment %>% select(wavelength_nm, light_screening_factor), by = "wavelength_nm") %>%
+  mutate(
+    attenuation_factor = replace_na(attenuation_factor, 1),
+    light_screening_factor = replace_na(light_screening_factor, 1),
+    `Measured at Surface` = irradiance_W_m2,
+    `Passing Through Pouch` = `Measured at Surface` * attenuation_factor,
+    `Depth-Averaged within pouch` = `Passing Through Pouch` * light_screening_factor
+  )
+
+# Sanity check -- should be one row per wavelength in the UVA + UVB range
+nrow(spectrum_check)
+
+spectrum_long <- spectrum_check %>%
+  select(wavelength_nm, `Measured at Surface`, `Passing Through Pouch`, `Depth-Averaged within pouch`) %>%
+  pivot_longer(
+    cols = c(`Measured at Surface`, `Passing Through Pouch`, `Depth-Averaged within pouch`),
+    names_to = "stage",
+    values_to = "irradiance"
+  ) %>%
+  mutate(stage = factor(stage, levels = c("Measured at Surface", "Passing Through Pouch", "Depth-Averaged within pouch")))
+
+stage_colors <- c(
+  "Measured at Surface" = "black",
+  "Passing Through Pouch" = "grey70",
+  "Depth-Averaged within pouch" = "#d62728"
+)
+stage_linetypes <- c(
+  "Measured at Surface" = "solid",
+  "Passing Through Pouch" = "dashed",
+  "Depth-Averaged within pouch" = "dotted"
+)
+
+Figure_S3 <- ggplot(spectrum_long, aes(x = wavelength_nm, y = irradiance,
+                                        color = stage, linetype = stage)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = stage_colors) +
+  scale_linetype_manual(values = stage_linetypes) +
+  labs(
+    x = "Wavelength (nm)",
+    y = "Irradiance (W/m\u00b2)",
+    color = NULL,
+    linetype = NULL
+  ) +
+  theme_paper() +
+  theme(legend.position = "bottom")
+
+Figure_S3
+
+save_pdf_png(
+  plot = Figure_S3,
+  path = "Figures/FigureS3.",
+  w = 169, h = 85
+)
+
+# ============================================================================
+# TABLE S1: MEASURED AT SURFACE vs. PASSING THROUGH POUCH vs. DEPTH-AVERAGED
+# WITHIN POUCH, BY DAY, TREATMENT/CONTROL, AND UV RANGE
+# ============================================================================
+dir_create("Tables")
+
+## Join the three stages' daily averages for one UV range into one table ----
+build_stage_summary <- function(surface_avg, pouch_avg, depth_avg, uv_type) {
+  mean_col_surface <- names(surface_avg)[grep("^mean_", names(surface_avg))][1]
+  mean_col_pouch   <- names(pouch_avg)[grep("^mean_", names(pouch_avg))][1]
+  mean_col_depth   <- names(depth_avg)[grep("^mean_", names(depth_avg))][1]
+
+  surface_avg %>%
+    select(date, condition, measured_at_surface = !!sym(mean_col_surface)) %>%
+    left_join(
+      pouch_avg %>% select(date, condition, passing_through_pouch = !!sym(mean_col_pouch)),
+      by = c("date", "condition")
+    ) %>%
+    left_join(
+      depth_avg %>% select(date, condition, depth_averaged_within_pouch = !!sym(mean_col_depth)),
+      by = c("date", "condition")
+    ) %>%
+    mutate(uv_type = uv_type)
+}
+
+uvb_stage_summary <- build_stage_summary(uvb_results$daily_average, uvb_results_attenuation_only$daily_average, uvb_results_adjusted$daily_average, "UVB")
+uva_stage_summary <- build_stage_summary(uva_results$daily_average, uva_results_attenuation_only$daily_average, uva_results_adjusted$daily_average, "UVA")
+
+## Assign "Day 1", "Day 2", ... labels from sorted unique dates, and relabel
+## condition Light/Dark as Treatment/Control ---------------------------------
+assign_day_labels <- function(stage_summary) {
+  date_lookup <- stage_summary %>%
+    distinct(date) %>%
+    arrange(date) %>%
+    mutate(day_label = paste("Day", row_number()))
+
+  stage_summary %>%
+    left_join(date_lookup, by = "date") %>%
+    mutate(
+      group_label = case_when(
+        condition == "Light" ~ "Treatment",
+        condition == "Dark" ~ "Control",
+        TRUE ~ condition
+      )
+    )
+}
+
+uvb_stage_summary <- assign_day_labels(uvb_stage_summary)
+uva_stage_summary <- assign_day_labels(uva_stage_summary)
+
+## "Average" row: mean of daily averages across all days, per Treatment/Control
+build_average_row <- function(stage_summary) {
+  stage_summary %>%
+    group_by(group_label) %>%
+    summarise(
+      measured_at_surface = mean(measured_at_surface, na.rm = TRUE),
+      passing_through_pouch = mean(passing_through_pouch, na.rm = TRUE),
+      depth_averaged_within_pouch = mean(depth_averaged_within_pouch, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(day_label = "Average")
+}
+
+uvb_average_row <- build_average_row(uvb_stage_summary)
+uva_average_row <- build_average_row(uva_stage_summary)
+
+## Combine day rows + Average row, Treatment listed before Control each day,
+## rounded to 2 decimal places to match the target table --------------------
+finalize_table <- function(stage_summary, average_row) {
+  day_order <- unique(stage_summary$day_label)
+
+  bind_rows(
+    stage_summary %>%
+      select(day_label, group_label, measured_at_surface, passing_through_pouch, depth_averaged_within_pouch),
+    average_row
+  ) %>%
+    mutate(
+      group_label = factor(group_label, levels = c("Treatment", "Control")),
+      day_label = factor(day_label, levels = c(day_order, "Average"))
+    ) %>%
+    arrange(day_label, group_label) %>%
+    mutate(across(c(measured_at_surface, passing_through_pouch, depth_averaged_within_pouch), ~ round(.x, 2)))
+}
+
+uvb_table <- finalize_table(uvb_stage_summary, uvb_average_row) %>%
+  rename_with(~ paste0("UVB_", .), -c(day_label, group_label))
+uva_table <- finalize_table(uva_stage_summary, uva_average_row) %>%
+  rename_with(~ paste0("UVA_", .), -c(day_label, group_label))
+
+## Combine UVA and UVB side by side (UVA columns first, matching the larger-
+## magnitude left block in the target table -- swap order here if backwards)
+summary_table <- uva_table %>%
+  left_join(uvb_table, by = c("day_label", "group_label")) %>%
+  rename(Day = day_label, Group = group_label)
+
+print("Surface / Pouch / Depth-Averaged summary table:")
+print(summary_table)
+
+write_csv(summary_table, "Tables/TableS_SurfacePouchDepth.csv")
+
+## Formatted version of the table (merged header spanners, grouped Day rows,
+## bolded Average row) matching the target layout ----------------------------
+## Rebuilt with kableExtra (already used for Tables 3 & 4) instead of gt, so
+## there's no dependency on gt/its heavier install requirements.
+
+uv_col_labels <- c("Measured at Surface", "Passing Through Pouch",
+                    "Depth-Averaged<br>within pouch")
+
+# Row numbers of the "Average" summary rows, so they can be bolded the way
+# gt's cells_row_groups(groups = "Average") / cells_stub(rows = ...) did
+average_rows <- which(summary_table$Day == "Average")
+
+summary_kable <- summary_table %>%
+  select(-Day) %>%  # Day becomes pack_rows() group labels below instead of a column
+  kable(
+    col.names = c("Group", uv_col_labels, uv_col_labels),
+    align = c("l", rep("c", 6)),
+    escape = FALSE  # allow the <br> line break in the "Depth-Averaged" label
+  ) %>%
+  kable_styling(bootstrap_options = c("bordered", "hover"), full_width = FALSE) %>%
+  add_header_above(c(" " = 1, "UVA" = 3, "UVB" = 3), bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Irradiance (W/m\u00b2)" = 6), bold = TRUE) %>%
+  row_spec(average_rows, bold = TRUE)
+
+# Add one Day/"Average" row-group label per block, bolding only the
+# "Average" label itself (gt didn't bold the "Day 1", "Day 2", ... labels)
+row_cursor <- 1
+for (day in as.character(unique(summary_table$Day))) {
+  n_rows <- sum(summary_table$Day == day)
+  summary_kable <- summary_kable %>%
+    pack_rows(
+      group_label = day,
+      start_row = row_cursor,
+      end_row = row_cursor + n_rows - 1,
+      bold = (day == "Average")
+    )
+  row_cursor <- row_cursor + n_rows
+}
+
+summary_kable
+
+```
+
+
+```{r Supplemental Material - Inhibition Testing}
+
+
+# Discrete x-axis: each dilution level gets an equal-width slot regardless
+# of the actual numeric gap between them (1, 5, 10 aren't evenly spaced),
+# so a wide `width` reliably fills most of each slot everywhere.
+plot_data <- inhibition_data %>%
+  mutate(dilution_factor = factor(dilution_factor, levels = sort(unique(dilution_factor))))
+
+ggplot(plot_data, aes(x = dilution_factor, y = copies_per_L)) +
+  geom_col(fill = "grey80", width = 0.9) +
+  geom_errorbar(
+    aes(ymin = total_conf_min_L, ymax = total_conf_max_L),
+    width = 0.3, color = "black"
+  ) +
+  facet_wrap(~ extract_id, ncol = 3, scales = "free_y") +
+  scale_y_continuous(limits = c(0, NA), labels = format_sci_10) +
+  labs(
+    x = "Dilution factor",
+    y = "Copies per L"
+  ) +
+  theme_paper() +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    axis.line = element_blank()
+  )
+
+
+
+```
+
+### Session Info
+
+```{r}
+#If renv::restore() isn't working for you, this is where you can final the version numbers of the packages we used, so you can try to create a similar working environment.
+
+sessionInfo()
+```
