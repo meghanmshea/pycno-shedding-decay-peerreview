@@ -1,6 +1,6 @@
 ---
 title: "Sunflower sea star (Pycnopodia helianthoides) environmental DNA (eDNA) shedding and decay: Influence of sunlight and comparison to other marine organisms"
-author: "Meghan M. Shea"
+author: "Anonymized"
 date: "`r Sys.Date()`"
 output: 
   html_document:
